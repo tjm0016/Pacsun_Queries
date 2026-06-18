@@ -285,3 +285,130 @@ SELECT
 FROM dbo.InventJournalTable
 WHERE journalnameid = 'COU-DCSYNC'
   AND IsDelete      IS NULL;
+
+
+-- ============================================================
+-- SECTION 6 : CURRENT STATE GAP  (WM count vs live INVENTSUM)
+-- Most accurate gap view — compares WM's latest nightly count
+-- to current D365 on-hand from INVENTSUM, bypassing the stale
+-- qty field in InventJournalTrans (which was calculated at
+-- journal-creation time and is outdated during backlog periods).
+--
+-- wm_minus_d365 interpretation:
+--   negative = D365 has MORE than WM says → shrink pending
+--   positive = D365 has LESS than WM says → found inventory
+--
+-- pxdcr format: DDYYYYMMDD (e.g. '020260617' = DC 02, 2026-06-17)
+-- Both 4901 and 4905 share the same latest pxdcr date.
+-- ============================================================
+
+WITH latest_pxdcr AS (
+    SELECT MAX(pxdcr) AS max_pxdcr
+    FROM dbo.pacwmcounts
+    WHERE IsDelete IS NULL
+      AND inventlocationid IN ('4901', '4905')
+),
+
+wm_latest AS (
+    SELECT
+        c.inventlocationid,
+        c.itemid,
+        c.inventsizeid,
+        c.inventcolorid,
+        c.wmslocationid,
+        SUM(CAST(c.wmcount AS DECIMAL(18,4)))  AS wm_qty
+    FROM dbo.pacwmcounts c
+    CROSS JOIN latest_pxdcr lp
+    WHERE c.IsDelete IS NULL
+      AND c.pxdcr    = lp.max_pxdcr
+      AND c.inventlocationid IN ('4901', '4905')
+    GROUP BY
+        c.inventlocationid, c.itemid, c.inventsizeid, c.inventcolorid, c.wmslocationid
+),
+
+d365_onhand AS (
+    SELECT
+        sDim.inventlocationid,
+        s.itemid,
+        sDim.inventsizeid,
+        sDim.inventcolorid,
+        sDim.wmslocationid,
+        SUM(s.physicalinvent)                  AS d365_onhand,
+        MAX(dc.retailvariantid)                AS retailvariantid
+    FROM dbo.inventsum s
+    JOIN dbo.inventdim sDim
+        ON  sDim.inventdimid     = s.inventdimid
+        AND sDim.dataareaid      = '1001'
+        AND sDim.IsDelete        IS NULL
+        AND sDim.inventlocationid IN ('4901', '4905')
+    -- Join through a base inventdim (color+size, no location) to reach inventdimcombination
+    JOIN dbo.inventdim pDim
+        ON  pDim.inventcolorid   = sDim.inventcolorid
+        AND pDim.inventsizeid    = sDim.inventsizeid
+        AND pDim.dataareaid      = sDim.dataareaid
+        AND pDim.IsDelete        IS NULL
+    JOIN dbo.inventdimcombination dc
+        ON  dc.inventdimid       = pDim.inventdimid
+        AND dc.itemid            = s.itemid
+        AND dc.dataareaid        = '1001'
+        AND dc.IsDelete          IS NULL
+    WHERE s.dataareaid = '1001'
+      AND s.IsDelete   IS NULL
+    GROUP BY
+        sDim.inventlocationid, s.itemid, sDim.inventsizeid, sDim.inventcolorid, sDim.wmslocationid
+),
+
+gap_calc AS (
+    SELECT
+        COALESCE(w.inventlocationid, oh.inventlocationid) AS inventlocationid,
+        COALESCE(w.itemid,           oh.itemid)           AS itemid,
+        COALESCE(w.inventsizeid,     oh.inventsizeid)     AS inventsizeid,
+        COALESCE(w.inventcolorid,    oh.inventcolorid)    AS inventcolorid,
+        COALESCE(w.wmslocationid,    oh.wmslocationid)    AS wmslocationid,
+        oh.retailvariantid,
+        ISNULL(w.wm_qty,        0)                        AS wm_qty,
+        ISNULL(oh.d365_onhand,  0)                        AS d365_onhand,
+        ISNULL(w.wm_qty, 0) - ISNULL(oh.d365_onhand, 0)  AS wm_minus_d365
+    FROM wm_latest w
+    FULL OUTER JOIN d365_onhand oh
+        ON  w.inventlocationid = oh.inventlocationid
+        AND w.itemid           = oh.itemid
+        AND w.inventsizeid     = oh.inventsizeid
+        AND w.inventcolorid    = oh.inventcolorid
+        AND w.wmslocationid    = oh.wmslocationid
+),
+
+net_per_item AS (
+    SELECT
+        inventlocationid, itemid, inventsizeid, inventcolorid,
+        SUM(wm_minus_d365) AS net_gap
+    FROM gap_calc
+    GROUP BY inventlocationid, itemid, inventsizeid, inventcolorid
+)
+
+SELECT
+    g.inventlocationid,
+    g.itemid,
+    g.retailvariantid,
+    g.inventsizeid,
+    g.inventcolorid,
+    g.wmslocationid,
+    g.wm_qty,
+    g.d365_onhand,
+    g.wm_minus_d365,
+    n.net_gap                               AS item_net_gap,
+    CASE
+        WHEN n.net_gap  = 0 THEN 'LC_TO_ACTIVE_MOVEMENT'   -- offset between buckets, expected
+        WHEN g.wm_minus_d365 < 0 THEN 'SHRINK'             -- D365 overstated vs WM
+        WHEN g.wm_minus_d365 > 0 THEN 'D365_UNDERSTATED'   -- D365 understated vs WM
+    END AS gap_type
+FROM gap_calc g
+JOIN net_per_item n
+    ON  g.inventlocationid = n.inventlocationid
+    AND g.itemid           = n.itemid
+    AND g.inventsizeid     = n.inventsizeid
+    AND g.inventcolorid    = n.inventcolorid
+WHERE g.wm_minus_d365 <> 0
+ORDER BY
+    g.inventlocationid,
+    ABS(g.wm_minus_d365) DESC;
