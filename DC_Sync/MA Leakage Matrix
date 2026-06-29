@@ -1,0 +1,311 @@
+import pyodbc
+
+import pandas as pd
+
+from sqlalchemy import create_engine
+
+import urllib
+
+import os
+ 
+raw_conn_str = (
+
+    "Driver={ODBC Driver 18 for SQL Server};"
+
+    "Server=d365-synapse-ps-prod-ondemand.sql.azuresynapse.net;"
+
+    "Database=dataverse_psprod_unq1fedfd537528f111a7e5000d3a5cc;"
+
+    "Authentication=ActiveDirectoryInteractive;"
+
+    "ApplicationIntent=ReadOnly;"
+
+    "Encrypt=yes;"
+
+    "TrustServerCertificate=no;"
+
+)
+ 
+ 
+gap_analysis_query = """
+
+WITH latest_pxdcr AS (
+
+    SELECT MAX(pxdcr) AS max_pxdcr
+
+    FROM dbo.pacwmcounts
+
+    WHERE IsDelete IS NULL
+
+      AND inventlocationid IN ('4901', '4905')
+
+),
+
+wm_latest AS (
+
+    SELECT
+
+        c.inventlocationid,
+
+        c.itemid,
+
+        c.inventsizeid,
+
+        c.inventcolorid,
+
+        c.wmslocationid,
+
+        SUM(CAST(c.wmcount AS DECIMAL(18,4)))  AS wm_qty
+
+    FROM dbo.pacwmcounts c
+
+    CROSS JOIN latest_pxdcr lp
+
+    WHERE c.IsDelete IS NULL
+
+      AND c.pxdcr    = lp.max_pxdcr
+
+      AND c.inventlocationid IN ('4901', '4905')
+
+    GROUP BY
+
+        c.inventlocationid, c.itemid, c.inventsizeid, c.inventcolorid, c.wmslocationid
+
+),
+
+d365_onhand AS (
+
+    SELECT
+
+        sDim.inventlocationid,
+
+        s.itemid,
+
+        sDim.inventsizeid,
+
+        sDim.inventcolorid,
+
+        sDim.wmslocationid,
+
+        SUM(s.physicalinvent)                  AS d365_onhand,
+
+        MAX(dc.retailvariantid)                AS retailvariantid
+
+    FROM dbo.inventsum s
+
+    JOIN dbo.inventdim sDim
+
+        ON  sDim.inventdimid     = s.inventdimid
+
+        AND sDim.dataareaid      = '1001'
+
+        AND sDim.IsDelete        IS NULL
+
+        AND sDim.inventlocationid IN ('4901', '4905')
+
+    JOIN dbo.inventdim pDim
+
+        ON  pDim.inventcolorid   = sDim.inventcolorid
+
+        AND pDim.inventsizeid    = sDim.inventsizeid
+
+        AND pDim.dataareaid      = sDim.dataareaid
+
+        AND pDim.IsDelete        IS NULL
+
+    JOIN dbo.inventdimcombination dc
+
+        ON  dc.inventdimid       = pDim.inventdimid
+
+        AND dc.itemid            = s.itemid
+
+        AND dc.dataareaid        = '1001'
+
+        AND dc.IsDelete          IS NULL
+
+    WHERE s.dataareaid = '1001'
+
+      AND s.IsDelete   IS NULL
+
+    GROUP BY
+
+        sDim.inventlocationid, s.itemid, sDim.inventsizeid, sDim.inventcolorid, sDim.wmslocationid
+
+)
+
+SELECT
+
+    COALESCE(w.inventlocationid, oh.inventlocationid) AS inventlocationid,
+
+    COALESCE(w.itemid,           oh.itemid)           AS itemid,
+
+    oh.retailvariantid,
+
+    ISNULL(w.wm_qty, 0) - ISNULL(oh.d365_onhand, 0)   AS missing_units
+
+FROM wm_latest w
+
+FULL OUTER JOIN d365_onhand oh
+
+    ON  w.inventlocationid = oh.inventlocationid
+
+    AND w.itemid           = oh.itemid
+
+    AND w.inventsizeid     = oh.inventsizeid
+
+    AND w.inventcolorid    = oh.inventcolorid
+
+    AND w.wmslocationid    = oh.wmslocationid
+
+WHERE (ISNULL(w.wm_qty, 0) - ISNULL(oh.d365_onhand, 0)) < 0 -- ONLY pull Shrink
+
+"""
+ 
+movement_query = """
+
+SELECT
+
+    trans.ItemId,
+
+    p.RetailVariantId,
+
+    ijt.JournalNameId,
+
+    SUM(trans.Qty) AS Recent_Journal_Qty
+
+FROM InventJournalTable ijt
+
+JOIN InventJournalTrans trans ON ijt.JournalId = trans.JournalId
+
+JOIN InventDim sDim ON sDim.InventDimId = trans.InventDimId
+
+JOIN InventDim pDim ON pDim.InventColorId = sDim.InventColorId
+
+    AND pDim.InventSizeId = sDim.InventSizeId
+
+    AND pDim.DataAreaId = sDim.DataAreaId
+
+JOIN InventDimCombination p ON p.InventDimId = pDim.InventDimId
+
+    AND p.ItemId = trans.ItemId
+
+WHERE ijt.IsDelete IS NULL 
+
+  AND trans.IsDelete IS NULL
+
+  AND ijt.createddatetime >= DATEADD(DAY, -14, GETUTCDATE()) 
+
+GROUP BY 
+
+    trans.ItemId, 
+
+    p.RetailVariantId, 
+
+    ijt.JournalNameId;
+
+"""
+ 
+ 
+def main():
+
+    print("Connecting to Azure Synapse...")
+
+    try:
+
+        params = urllib.parse.quote_plus(raw_conn_str)
+
+        engine = create_engine(f"mssql+pyodbc:///?odbc_connect={params}")
+
+    except Exception as e:
+
+        print(f"Failed to build connection engine: {e}")
+
+        return
+ 
+    print("Executing Gap Analysis & Audit Trail Queries... (This may take a moment)")
+
+    try:
+
+        with engine.connect() as conn:
+
+            df_shrink = pd.read_sql(gap_analysis_query, conn)
+
+            df_movements = pd.read_sql(movement_query, conn)
+
+    except Exception as e:
+
+        print(f"Failed to execute queries: {e}")
+
+        return
+ 
+    print("Processing Leakage Matrix...\n")
+ 
+    # Shrink by Variant
+
+    df_shrink_agg = df_shrink.groupby(['itemid', 'retailvariantid'])['missing_units'].sum().reset_index()
+
+    df_shrink_agg['missing_units'] = df_shrink_agg['missing_units'].abs()
+ 
+    df_pivot = df_movements.pivot_table(
+
+        index=['ItemId', 'RetailVariantId'],
+
+        columns='JournalNameId',
+
+        values='Recent_Journal_Qty',
+
+        aggfunc='sum'
+
+    ).fillna(0).reset_index()
+ 
+    # Shrink with the Movements
+
+    df_root_cause = pd.merge(
+
+        df_shrink_agg,
+
+        df_pivot,
+
+        left_on=['itemid', 'retailvariantid'],
+
+        right_on=['ItemId', 'RetailVariantId'],
+
+        how='left'
+
+    )
+ 
+    df_root_cause.drop(columns=['ItemId', 'RetailVariantId'], inplace=True, errors='ignore')
+
+    df_root_cause.fillna(0, inplace=True)
+
+    df_root_cause = df_root_cause.sort_values(by='missing_units', ascending=False)
+ 
+    print("   TOP 10 SHRINK ITEMS & RECENT ACTIVITY (LEAKAGE MATRIX)")
+ 
+    cols_to_print = ['retailvariantid', 'missing_units']
+
+    journal_cols = [col for col in df_pivot.columns if col not in ['ItemId', 'RetailVariantId']]
+
+    cols_to_print.extend(journal_cols[:4])
+ 
+    print(df_root_cause[cols_to_print].head(10).to_string(index=False))
+
+    print("\n* Note: Quantities under journal columns indicate net movement in the last 14 days.")
+ 
+    downloads_folder = os.path.join(os.path.expanduser('~'), 'Downloads')
+ 
+    if not os.path.exists(downloads_folder):
+
+        downloads_folder = os.getcwd()
+ 
+    output_file = os.path.join(downloads_folder, 'root_cause_leakage_matrix.csv')
+ 
+    df_root_cause.to_csv(output_file, index=False)
+
+    print(f"\nsaved to: {output_file}")
+ 
+ 
+if __name__ == "__main__":
+
+    main()
+ 
