@@ -3,6 +3,7 @@ SELECT
 	idc.itemid,
 	id.inventcolorid,
 	id.inventsizeid,
+	idc.itemid + '-' + id.inventcolorid + '-' + id.inventsizeid AS long_sku,
 	idc.retailvariantid,
 	idc.ProductLifecycleStateId
 FROM
