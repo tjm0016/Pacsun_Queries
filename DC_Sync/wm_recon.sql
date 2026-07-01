@@ -246,11 +246,74 @@ pix_rollup AS (
 -- Full mapped+unmapped detail (Step 3b):
 SELECT * FROM pix_rollup ORDER BY itemid, mapping_status, pix_qty DESC;
 
--- Aggregate unmapped-only report (Step 4a) — run separately against the same pix_rollup CTE:
--- SELECT pxtxtp, pxtxcd, pxaccd, SUM(tx_count) AS tx_count, SUM(pix_qty) AS total_qty,
---        COUNT(DISTINCT itemid) AS item_count
--- FROM pix_rollup WHERE mapping_status = 'UNMAPPED'
--- GROUP BY pxtxtp, pxtxcd, pxaccd ORDER BY total_qty DESC;
+
+-- ============================================================================
+-- STEP 4a: REPORT — Unmapped PIX qty, by PIX code (across Top-20 items, 14 days)
+-- Same top20 + pix_rollup logic as Step 3b, aggregated down to just the
+-- UNMAPPED codes. These are transaction codes with no known posting path into
+-- D365 that we can find in pacwmpixtransactionmappingtable or the other
+-- known-mapped types (606/03, 620/pxaccd=03, 615/01, 605).
+-- ============================================================================
+WITH latest_pxdcr AS (
+    SELECT MAX(pxdcr) AS max_pxdcr FROM dbo.pacwmcounts
+    WHERE IsDelete IS NULL AND inventlocationid IN ('4901','4905')
+),
+wm_net AS (
+    SELECT c.itemid, SUM(CAST(c.wmcount AS DECIMAL(18,4))) AS wm_qty
+    FROM dbo.pacwmcounts c CROSS JOIN latest_pxdcr lp
+    WHERE c.IsDelete IS NULL AND c.pxdcr = lp.max_pxdcr AND c.inventlocationid IN ('4901','4905')
+    GROUP BY c.itemid
+),
+d365_net AS (
+    SELECT s.itemid, SUM(s.physicalinvent) AS d365_qty
+    FROM dbo.inventsum s
+    JOIN dbo.inventdim sDim ON sDim.inventdimid = s.inventdimid AND sDim.dataareaid='1001'
+        AND sDim.IsDelete IS NULL AND sDim.inventlocationid IN ('4901','4905')
+    WHERE s.dataareaid='1001' AND s.IsDelete IS NULL
+    GROUP BY s.itemid
+),
+gap_by_item AS (
+    SELECT COALESCE(w.itemid, oh.itemid) COLLATE DATABASE_DEFAULT AS itemid,
+           SUM(ISNULL(w.wm_qty,0) - ISNULL(oh.d365_qty,0)) AS net_gap
+    FROM wm_net w
+    FULL OUTER JOIN d365_net oh ON w.itemid = oh.itemid
+    GROUP BY COALESCE(w.itemid, oh.itemid)
+    HAVING SUM(ISNULL(w.wm_qty,0) - ISNULL(oh.d365_qty,0)) <> 0
+),
+top20 AS (
+    SELECT TOP 20 itemid FROM gap_by_item ORDER BY ABS(net_gap) DESC
+),
+pix_rollup AS (
+    SELECT
+        (p.pxstyl + '-' + p.pxssfx + '-' + p.pxcolr) COLLATE DATABASE_DEFAULT AS itemid,
+        p.pxtxtp, p.pxtxcd, p.pxaccd,
+        CAST(CASE
+            WHEN m.journalnameid IS NOT NULL          THEN 'MAPPED'
+            WHEN p.pxtxtp='606' AND p.pxtxcd='03'     THEN 'MAPPED'
+            WHEN p.pxtxtp='620' AND p.pxaccd='03'     THEN 'MAPPED'
+            WHEN p.pxtxtp='615' AND p.pxtxcd='01'     THEN 'MAPPED'
+            WHEN p.pxtxtp='605'                        THEN 'MAPPED'
+            ELSE 'UNMAPPED'
+        END AS VARCHAR(20)) COLLATE DATABASE_DEFAULT AS mapping_status,
+        CAST(p.pxinva AS BIGINT) / 10000.0 AS pix_qty
+    FROM dbo.pacwmpixmessage p
+    OUTER APPLY (
+        SELECT TOP 1 mm.journalnameid
+        FROM dbo.pacwmpixtransactionmappingtable mm
+        WHERE mm.pxtxtp = p.pxtxtp AND mm.pxtxcd = p.pxtxcd
+          AND (mm.pxaccd = p.pxaccd OR mm.pxaccd = '' OR mm.pxaccd IS NULL)
+        ORDER BY CASE WHEN mm.pxaccd = p.pxaccd THEN 0 ELSE 1 END
+    ) m
+    WHERE p.IsDelete IS NULL
+      AND p.createddatetime >= DATEADD(DAY,-14,GETUTCDATE())
+      AND (p.pxstyl + '-' + p.pxssfx + '-' + p.pxcolr) COLLATE DATABASE_DEFAULT IN (SELECT itemid FROM top20)
+)
+SELECT pxtxtp, pxtxcd, pxaccd,
+    COUNT(*) AS tx_count, SUM(pix_qty) AS total_qty, COUNT(DISTINCT itemid) AS item_count
+FROM pix_rollup
+WHERE mapping_status = 'UNMAPPED'
+GROUP BY pxtxtp, pxtxcd, pxaccd
+ORDER BY total_qty DESC;
 
 
 -- ============================================================================
