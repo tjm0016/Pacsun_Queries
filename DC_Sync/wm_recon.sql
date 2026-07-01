@@ -13,7 +13,7 @@
 --     mapping used by the integration itself - confirmed via direct query 2026-07-01)
 --   - dbo.pacasnerrortable       (ASN receiving errors, not previously queried in this repo)
 --
--- Key facts confirmed live on 2026-07-01 (not documented anywhere before this file):
+-- Key facts confirmed live on 2026-07-01:
 --   - InventTransOrigin.referencecategory: 0=Sales(SO)/Allocation demand, 3=Purch(PO
 --     receipts), 4=MOV-DCADJ, 6=CTN-TRANSFER, 13=COU-DCSYNC. Confirmed by joining
 --     referenceid to SalesTable/PurchTable/InventJournalTable.
@@ -25,14 +25,27 @@
 --     COLLATE DATABASE_DEFAULT on every itemid/text column involved or it throws
 --     "Cannot resolve the collation conflict".
 --   - No literal PIX code named "GRS" exists in pacwmpixmessage or
---     pacwmdailysyncbucketmapping. Step 4c treats 606/03 (ASN receipt scan) as the
---     "goods receipt" event. Relabel if "GRS" means something more specific in WM terms.
+--     pacwmdailysyncbucketmapping.
 --
--- Finding from the 2026-07-01 run (see chat/report for full detail): all 20 of the
--- SKU-level variances on that day trace back to a same-day PO receipt (most posted to
--- D365 within hours of the query running), while the WM comparison count comes from the
--- last nightly pxdcr snapshot - i.e. the gap is mostly TIMING_GAP, not real shrink, and
--- should self-correct at tonight's sync for all but the oldest-dated receipt in the set.
+-- CORRECTED METHODOLOGY (2026-07-01, second pass): the first version of Step 2 compared
+-- the latest WM pacwmcounts snapshot against LIVE dbo.inventsum at query-run time. That's
+-- an invalid cross-time comparison whenever a PO receipt posts between the WM snapshot and
+-- your query - it manufactures fake "shrink" out of nothing. InventJournalTrans.qty for a
+-- COU-DCSYNC journal is computed ONCE and FROZEN at journal-creation time (WM counted minus
+-- D365 on-hand as of that moment) - read that instead of recomputing live. Step 2 below
+-- uses the frozen qty from the most recent journal batch. See feedback memory
+-- "journal-vs-live-comparison" for the full story of how this was caught.
+--
+-- Finding from the corrected run: nearly all of the top-20 items sit near-zero net qty
+-- through 6/29, then jump sharply and simultaneously on the night of 6/30 - not one item's
+-- fluke, a shared pattern. Step 3a explains the shape: each item got one large PO_RECEIPT
+-- sometime 6/25-6/30, and CTN-TRANSFER has posted large negative quantities EVERY DAY SINCE
+-- at high volume. This is a cumulative multi-day pattern, not a same-day timing blip.
+-- Leading candidate mechanism: PIX 618/55/03 (pick-short/inventory-variance) is the largest
+-- unmapped-PIX signal, hitting all 20 items (~157K units/14 days) - a plausible direct
+-- explanation for why WM's physical count runs behind D365's book qty on exactly the
+-- highest-volume shipping items. Not confirmed as root cause; CTN-TRANSFER posting-vs-
+-- physical-count lag is an equally live alternative. Needs WM ops input to resolve further.
 -- ============================================================================
 
 
@@ -53,167 +66,175 @@ ORDER BY journal_date_pst DESC;
 
 
 -- ============================================================================
--- STEP 2: TOP 20 VARIANCES — current-state WM vs D365 gap (latest pxdcr snapshot
--- vs live INVENTSUM), net across Active + Lock_Code buckets per item/size/color.
--- Netting across buckets is what excludes LC_TO_ACTIVE_MOVEMENT: when a
--- lock-code release exactly offsets an active increase, net_gap = 0 and the
--- row is dropped automatically (WHERE net_gap <> 0).
+-- STEP 2: TOP 20 VARIANCES — frozen InventJournalTrans.qty from the most recent
+-- COU-DCSYNC journal batch, summed per item across ALL lines/buckets in that batch.
+-- Summing across buckets is what excludes LC_TO_ACTIVE_MOVEMENT (a lock-code release
+-- that exactly offsets an active increase nets to ~0 and won't rank near the top).
+-- net_to_gross_ratio close to 1 = one-directional, real signal; close to 0 = mostly a
+-- wash between buckets (WM has the units, just in a different bucket than D365 expects).
 -- ============================================================================
-WITH latest_pxdcr AS (
-    SELECT MAX(pxdcr) AS max_pxdcr
-    FROM dbo.pacwmcounts
-    WHERE IsDelete IS NULL AND inventlocationid IN ('4901','4905')
+WITH latest_journal_batch AS (
+    SELECT MAX(CAST(createddatetime AT TIME ZONE 'UTC' AT TIME ZONE 'Pacific Standard Time' AS DATE)) AS latest_night
+    FROM dbo.InventJournalTable
+    WHERE journalnameid = 'COU-DCSYNC' AND IsDelete IS NULL
 ),
-wm_net AS (
-    SELECT c.inventlocationid, c.itemid, c.inventsizeid, c.inventcolorid,
-           SUM(CAST(c.wmcount AS DECIMAL(18,4))) AS wm_qty
-    FROM dbo.pacwmcounts c
-    CROSS JOIN latest_pxdcr lp
-    WHERE c.IsDelete IS NULL AND c.pxdcr = lp.max_pxdcr
-      AND c.inventlocationid IN ('4901','4905')
-    GROUP BY c.inventlocationid, c.itemid, c.inventsizeid, c.inventcolorid
-),
-d365_net AS (
-    SELECT sDim.inventlocationid, s.itemid, sDim.inventsizeid, sDim.inventcolorid,
-           SUM(s.physicalinvent) AS d365_qty
-    FROM dbo.inventsum s
-    JOIN dbo.inventdim sDim ON sDim.inventdimid = s.inventdimid AND sDim.dataareaid='1001'
-        AND sDim.IsDelete IS NULL AND sDim.inventlocationid IN ('4901','4905')
-    WHERE s.dataareaid='1001' AND s.IsDelete IS NULL
-    GROUP BY sDim.inventlocationid, s.itemid, sDim.inventsizeid, sDim.inventcolorid
-),
-gap_by_sku AS (
-    SELECT
-        COALESCE(w.itemid, oh.itemid)               AS itemid,
-        COALESCE(w.inventcolorid, oh.inventcolorid) AS inventcolorid,
-        COALESCE(w.inventsizeid, oh.inventsizeid)   AS inventsizeid,
-        SUM(ISNULL(w.wm_qty,0))                     AS wm_qty,
-        SUM(ISNULL(oh.d365_qty,0))                  AS d365_qty,
-        SUM(ISNULL(w.wm_qty,0) - ISNULL(oh.d365_qty,0)) AS net_gap
-    FROM wm_net w
-    FULL OUTER JOIN d365_net oh
-        ON  w.inventlocationid = oh.inventlocationid AND w.itemid = oh.itemid
-        AND w.inventsizeid     = oh.inventsizeid     AND w.inventcolorid = oh.inventcolorid
-    GROUP BY COALESCE(w.itemid, oh.itemid), COALESCE(w.inventcolorid, oh.inventcolorid),
-             COALESCE(w.inventsizeid, oh.inventsizeid)
-)
-SELECT TOP 20 itemid, inventcolorid, inventsizeid, wm_qty, d365_qty, net_gap
-FROM gap_by_sku
-WHERE net_gap <> 0
-ORDER BY ABS(net_gap) DESC;
-
-
--- ============================================================================
--- STEP 3a: TRANS-ACTION ROLLUP for the Top-20 items (last 14 days, DC locations)
--- Categories: ALLOCATION_SALES (referencecategory=0/SalesTable demand),
--- PO_RECEIPT (referencecategory=3/PurchTable), inventory movement journals
--- (MOV-DCADJ, CTN-TRANSFER). COU-DCSYNC itself is excluded — it's the
--- correction being investigated, not a contributing cause.
--- top20 is recomputed inline (same logic as Step 2) so this section is
--- self-contained and always reflects the current top-20, no manual paste needed.
--- ============================================================================
-WITH latest_pxdcr AS (
-    SELECT MAX(pxdcr) AS max_pxdcr FROM dbo.pacwmcounts
-    WHERE IsDelete IS NULL AND inventlocationid IN ('4901','4905')
-),
-wm_net AS (
-    SELECT c.itemid, SUM(CAST(c.wmcount AS DECIMAL(18,4))) AS wm_qty
-    FROM dbo.pacwmcounts c CROSS JOIN latest_pxdcr lp
-    WHERE c.IsDelete IS NULL AND c.pxdcr = lp.max_pxdcr AND c.inventlocationid IN ('4901','4905')
-    GROUP BY c.itemid
-),
-d365_net AS (
-    SELECT s.itemid, SUM(s.physicalinvent) AS d365_qty
-    FROM dbo.inventsum s
-    JOIN dbo.inventdim sDim ON sDim.inventdimid = s.inventdimid AND sDim.dataareaid='1001'
-        AND sDim.IsDelete IS NULL AND sDim.inventlocationid IN ('4901','4905')
-    WHERE s.dataareaid='1001' AND s.IsDelete IS NULL
-    GROUP BY s.itemid
-),
-gap_by_item AS (
-    SELECT COALESCE(w.itemid, oh.itemid) COLLATE DATABASE_DEFAULT AS itemid,
-           SUM(ISNULL(w.wm_qty,0) - ISNULL(oh.d365_qty,0)) AS net_gap
-    FROM wm_net w
-    FULL OUTER JOIN d365_net oh ON w.itemid = oh.itemid
-    GROUP BY COALESCE(w.itemid, oh.itemid)
-    HAVING SUM(ISNULL(w.wm_qty,0) - ISNULL(oh.d365_qty,0)) <> 0
-),
-top20 AS (
-    SELECT TOP 20 itemid FROM gap_by_item ORDER BY ABS(net_gap) DESC
-),
-trans_rollup AS (
-    SELECT
-        t.itemid COLLATE DATABASE_DEFAULT AS itemid,
-        CAST(CASE o.referencecategory
-            WHEN 0 THEN 'ALLOCATION_SALES'
-            WHEN 3 THEN 'PO_RECEIPT'
-            ELSE CONCAT('OTHER_REFCAT_', o.referencecategory)
-        END AS VARCHAR(60)) COLLATE DATABASE_DEFAULT AS category,
-        COUNT(*)   AS trans_count,
-        SUM(t.qty) AS net_qty
-    FROM dbo.inventtransorigin o
-    INNER JOIN dbo.inventtrans t ON t.inventtransorigin = o.recid AND t.dataareaid='1001'
-    INNER JOIN dbo.inventdim d ON d.inventdimid = t.inventdimid AND d.dataareaid='1001'
-    WHERE o.dataareaid='1001' AND o.IsDelete IS NULL AND t.IsDelete IS NULL
-      AND d.inventlocationid IN ('4901','4905')
-      AND t.datephysical >= DATEADD(DAY,-14,GETUTCDATE())
-      AND o.referencecategory IN (0,3)
-      AND t.itemid COLLATE DATABASE_DEFAULT IN (SELECT itemid FROM top20)
-    GROUP BY t.itemid, o.referencecategory
-    UNION ALL
-    SELECT
-        jtr.itemid COLLATE DATABASE_DEFAULT AS itemid,
-        CAST(CONCAT('INVENTORY_MOVEMENT_', jt.journalnameid) AS VARCHAR(60)) COLLATE DATABASE_DEFAULT AS category,
-        COUNT(*)     AS trans_count,
-        SUM(jtr.qty) AS net_qty
+item_net AS (
+    SELECT jtr.itemid COLLATE DATABASE_DEFAULT AS itemid,
+           SUM(jtr.qty)        AS net_qty,
+           SUM(ABS(jtr.qty))   AS gross_qty,
+           COUNT(*)            AS line_count
     FROM dbo.InventJournalTrans jtr
     INNER JOIN dbo.InventJournalTable jt ON jt.journalid = jtr.journalid AND jt.IsDelete IS NULL
     INNER JOIN dbo.inventdim d ON d.inventdimid = jtr.inventdimid AND d.dataareaid='1001' AND d.IsDelete IS NULL
-    WHERE jtr.dataareaid='1001' AND jtr.IsDelete IS NULL
-      AND jt.journalnameid IN ('MOV-DCADJ','CTN-TRANSFER')
+    CROSS JOIN latest_journal_batch lb
+    WHERE jt.journalnameid = 'COU-DCSYNC'
+      AND CAST(jt.createddatetime AT TIME ZONE 'UTC' AT TIME ZONE 'Pacific Standard Time' AS DATE) = lb.latest_night
+      AND jtr.dataareaid='1001' AND jtr.IsDelete IS NULL
       AND d.inventlocationid IN ('4901','4905')
-      AND jt.createddatetime >= DATEADD(DAY,-14,GETUTCDATE())
-      AND jtr.itemid COLLATE DATABASE_DEFAULT IN (SELECT itemid FROM top20)
-    GROUP BY jtr.itemid, jt.journalnameid
+    GROUP BY jtr.itemid
 )
-SELECT * FROM trans_rollup ORDER BY itemid, category;
+SELECT TOP 20
+    itemid, net_qty, gross_qty, line_count,
+    CASE WHEN gross_qty > 0 THEN CAST(ABS(net_qty) AS DECIMAL(18,4)) / gross_qty ELSE NULL END AS net_to_gross_ratio
+FROM item_net
+ORDER BY ABS(net_qty) DESC;
+
+
+-- ============================================================================
+-- STEP 2b: MULTI-NIGHT TREND for the Top-20 items, last ~7 nights of COU-DCSYNC
+-- journals (posted + unposted). Reveals whether an item's imbalance is new (only
+-- appears on the latest night), a recurring wash (large gross, near-zero net, every
+-- night), or a persistent/growing real gap (net stays large across multiple nights).
+-- ============================================================================
+WITH latest_journal_batch AS (
+    SELECT MAX(CAST(createddatetime AT TIME ZONE 'UTC' AT TIME ZONE 'Pacific Standard Time' AS DATE)) AS latest_night
+    FROM dbo.InventJournalTable
+    WHERE journalnameid = 'COU-DCSYNC' AND IsDelete IS NULL
+),
+item_net AS (
+    SELECT jtr.itemid COLLATE DATABASE_DEFAULT AS itemid, SUM(jtr.qty) AS net_qty
+    FROM dbo.InventJournalTrans jtr
+    INNER JOIN dbo.InventJournalTable jt ON jt.journalid = jtr.journalid AND jt.IsDelete IS NULL
+    INNER JOIN dbo.inventdim d ON d.inventdimid = jtr.inventdimid AND d.dataareaid='1001' AND d.IsDelete IS NULL
+    CROSS JOIN latest_journal_batch lb
+    WHERE jt.journalnameid = 'COU-DCSYNC'
+      AND CAST(jt.createddatetime AT TIME ZONE 'UTC' AT TIME ZONE 'Pacific Standard Time' AS DATE) = lb.latest_night
+      AND jtr.dataareaid='1001' AND jtr.IsDelete IS NULL
+      AND d.inventlocationid IN ('4901','4905')
+    GROUP BY jtr.itemid
+),
+top20 AS (
+    SELECT TOP 20 itemid FROM item_net ORDER BY ABS(net_qty) DESC
+)
+SELECT
+    jtr.itemid COLLATE DATABASE_DEFAULT AS itemid,
+    CAST(jt.createddatetime AT TIME ZONE 'UTC' AT TIME ZONE 'Pacific Standard Time' AS DATE) AS night_pst,
+    MAX(jt.posted)      AS any_posted,
+    SUM(jtr.qty)         AS net_qty,
+    SUM(ABS(jtr.qty))    AS gross_qty,
+    COUNT(*)             AS line_count
+FROM dbo.InventJournalTrans jtr
+INNER JOIN dbo.InventJournalTable jt ON jt.journalid = jtr.journalid AND jt.IsDelete IS NULL
+INNER JOIN dbo.inventdim d ON d.inventdimid = jtr.inventdimid AND d.dataareaid='1001' AND d.IsDelete IS NULL
+WHERE jt.journalnameid = 'COU-DCSYNC'
+  AND jt.createddatetime >= DATEADD(DAY,-7,GETUTCDATE())
+  AND jtr.dataareaid='1001' AND jtr.IsDelete IS NULL
+  AND d.inventlocationid IN ('4901','4905')
+  AND jtr.itemid COLLATE DATABASE_DEFAULT IN (SELECT itemid FROM top20)
+GROUP BY jtr.itemid, CAST(jt.createddatetime AT TIME ZONE 'UTC' AT TIME ZONE 'Pacific Standard Time' AS DATE)
+ORDER BY itemid, night_pst;
+
+
+-- ============================================================================
+-- STEP 3a: TRANS-ACTION ROLLUP, dated, for the Top-20 items (since 6/25, DC locations)
+-- Categories: ALLOCATION_SALES (referencecategory=0/SalesTable demand), PO_RECEIPT
+-- (referencecategory=3/PurchTable), inventory movement journals (MOV-DCADJ,
+-- CTN-TRANSFER). Dated by day so you can see the receipt-then-drawdown pattern.
+-- COU-DCSYNC itself is excluded — it's the correction being investigated.
+-- ============================================================================
+WITH latest_journal_batch AS (
+    SELECT MAX(CAST(createddatetime AT TIME ZONE 'UTC' AT TIME ZONE 'Pacific Standard Time' AS DATE)) AS latest_night
+    FROM dbo.InventJournalTable
+    WHERE journalnameid = 'COU-DCSYNC' AND IsDelete IS NULL
+),
+item_net AS (
+    SELECT jtr.itemid COLLATE DATABASE_DEFAULT AS itemid, SUM(jtr.qty) AS net_qty
+    FROM dbo.InventJournalTrans jtr
+    INNER JOIN dbo.InventJournalTable jt ON jt.journalid = jtr.journalid AND jt.IsDelete IS NULL
+    INNER JOIN dbo.inventdim d ON d.inventdimid = jtr.inventdimid AND d.dataareaid='1001' AND d.IsDelete IS NULL
+    CROSS JOIN latest_journal_batch lb
+    WHERE jt.journalnameid = 'COU-DCSYNC'
+      AND CAST(jt.createddatetime AT TIME ZONE 'UTC' AT TIME ZONE 'Pacific Standard Time' AS DATE) = lb.latest_night
+      AND jtr.dataareaid='1001' AND jtr.IsDelete IS NULL
+      AND d.inventlocationid IN ('4901','4905')
+    GROUP BY jtr.itemid
+),
+top20 AS (
+    SELECT TOP 20 itemid FROM item_net ORDER BY ABS(net_qty) DESC
+)
+SELECT
+    t.itemid COLLATE DATABASE_DEFAULT AS itemid,
+    CAST(CASE o.referencecategory
+        WHEN 0 THEN 'ALLOCATION_SALES'
+        WHEN 3 THEN 'PO_RECEIPT'
+        ELSE CONCAT('OTHER_REFCAT_', o.referencecategory)
+    END AS VARCHAR(60)) COLLATE DATABASE_DEFAULT AS category,
+    CAST(t.datephysical AS DATE) AS trans_date,
+    COUNT(*)   AS trans_count,
+    SUM(t.qty) AS net_qty
+FROM dbo.inventtransorigin o
+INNER JOIN dbo.inventtrans t ON t.inventtransorigin = o.recid AND t.dataareaid='1001'
+INNER JOIN dbo.inventdim d ON d.inventdimid = t.inventdimid AND d.dataareaid='1001'
+WHERE o.dataareaid='1001' AND o.IsDelete IS NULL AND t.IsDelete IS NULL
+  AND d.inventlocationid IN ('4901','4905')
+  AND t.datephysical >= '2026-06-25'
+  AND o.referencecategory IN (0,3)
+  AND t.itemid COLLATE DATABASE_DEFAULT IN (SELECT itemid FROM top20)
+GROUP BY t.itemid, o.referencecategory, CAST(t.datephysical AS DATE)
+UNION ALL
+SELECT
+    jtr.itemid COLLATE DATABASE_DEFAULT AS itemid,
+    CAST(CONCAT('INVENTORY_MOVEMENT_', jt.journalnameid) AS VARCHAR(60)) COLLATE DATABASE_DEFAULT AS category,
+    CAST(jt.createddatetime AT TIME ZONE 'UTC' AT TIME ZONE 'Pacific Standard Time' AS DATE) AS trans_date,
+    COUNT(*)     AS trans_count,
+    SUM(jtr.qty) AS net_qty
+FROM dbo.InventJournalTrans jtr
+INNER JOIN dbo.InventJournalTable jt ON jt.journalid = jtr.journalid AND jt.IsDelete IS NULL
+INNER JOIN dbo.inventdim d ON d.inventdimid = jtr.inventdimid AND d.dataareaid='1001' AND d.IsDelete IS NULL
+WHERE jtr.dataareaid='1001' AND jtr.IsDelete IS NULL
+  AND jt.journalnameid IN ('MOV-DCADJ','CTN-TRANSFER')
+  AND d.inventlocationid IN ('4901','4905')
+  AND jt.createddatetime >= '2026-06-25'
+  AND jtr.itemid COLLATE DATABASE_DEFAULT IN (SELECT itemid FROM top20)
+GROUP BY jtr.itemid, jt.journalnameid, CAST(jt.createddatetime AT TIME ZONE 'UTC' AT TIME ZONE 'Pacific Standard Time' AS DATE)
+ORDER BY itemid, trans_date;
 
 
 -- ============================================================================
 -- STEP 3b / 4a: PIX ROLLUP + UNMAPPED PIX REPORT for the Top-20 items (14 days)
--- Aligns mapped PIX (via pacwmpixtransactionmappingtable, plus known-mapped
--- 606/03 ASN receipt, 620/pxaccd=03 allocation fulfillment, 615/01 product dims,
--- 605 daily sync) against everything else, which is reported as UNMAPPED.
--- itemid reconstructed as pxstyl-pxssfx-pxcolr (matches pacwmcounts.itemid format).
+-- Aligns mapped PIX (via pacwmpixtransactionmappingtable, plus known-mapped 606/03
+-- ASN receipt, 620/pxaccd=03 allocation fulfillment, 615/01 product dims, 605 daily
+-- sync) against everything else, which is reported as UNMAPPED.
 -- ============================================================================
-WITH latest_pxdcr AS (
-    SELECT MAX(pxdcr) AS max_pxdcr FROM dbo.pacwmcounts
-    WHERE IsDelete IS NULL AND inventlocationid IN ('4901','4905')
+WITH latest_journal_batch AS (
+    SELECT MAX(CAST(createddatetime AT TIME ZONE 'UTC' AT TIME ZONE 'Pacific Standard Time' AS DATE)) AS latest_night
+    FROM dbo.InventJournalTable
+    WHERE journalnameid = 'COU-DCSYNC' AND IsDelete IS NULL
 ),
-wm_net AS (
-    SELECT c.itemid, SUM(CAST(c.wmcount AS DECIMAL(18,4))) AS wm_qty
-    FROM dbo.pacwmcounts c CROSS JOIN latest_pxdcr lp
-    WHERE c.IsDelete IS NULL AND c.pxdcr = lp.max_pxdcr AND c.inventlocationid IN ('4901','4905')
-    GROUP BY c.itemid
-),
-d365_net AS (
-    SELECT s.itemid, SUM(s.physicalinvent) AS d365_qty
-    FROM dbo.inventsum s
-    JOIN dbo.inventdim sDim ON sDim.inventdimid = s.inventdimid AND sDim.dataareaid='1001'
-        AND sDim.IsDelete IS NULL AND sDim.inventlocationid IN ('4901','4905')
-    WHERE s.dataareaid='1001' AND s.IsDelete IS NULL
-    GROUP BY s.itemid
-),
-gap_by_item AS (
-    SELECT COALESCE(w.itemid, oh.itemid) COLLATE DATABASE_DEFAULT AS itemid,
-           SUM(ISNULL(w.wm_qty,0) - ISNULL(oh.d365_qty,0)) AS net_gap
-    FROM wm_net w
-    FULL OUTER JOIN d365_net oh ON w.itemid = oh.itemid
-    GROUP BY COALESCE(w.itemid, oh.itemid)
-    HAVING SUM(ISNULL(w.wm_qty,0) - ISNULL(oh.d365_qty,0)) <> 0
+item_net AS (
+    SELECT jtr.itemid COLLATE DATABASE_DEFAULT AS itemid, SUM(jtr.qty) AS net_qty
+    FROM dbo.InventJournalTrans jtr
+    INNER JOIN dbo.InventJournalTable jt ON jt.journalid = jtr.journalid AND jt.IsDelete IS NULL
+    INNER JOIN dbo.inventdim d ON d.inventdimid = jtr.inventdimid AND d.dataareaid='1001' AND d.IsDelete IS NULL
+    CROSS JOIN latest_journal_batch lb
+    WHERE jt.journalnameid = 'COU-DCSYNC'
+      AND CAST(jt.createddatetime AT TIME ZONE 'UTC' AT TIME ZONE 'Pacific Standard Time' AS DATE) = lb.latest_night
+      AND jtr.dataareaid='1001' AND jtr.IsDelete IS NULL
+      AND d.inventlocationid IN ('4901','4905')
+    GROUP BY jtr.itemid
 ),
 top20 AS (
-    SELECT TOP 20 itemid FROM gap_by_item ORDER BY ABS(net_gap) DESC
+    SELECT TOP 20 itemid FROM item_net ORDER BY ABS(net_qty) DESC
 ),
 pix_rollup AS (
     SELECT
@@ -249,39 +270,30 @@ SELECT * FROM pix_rollup ORDER BY itemid, mapping_status, pix_qty DESC;
 
 -- ============================================================================
 -- STEP 4a: REPORT — Unmapped PIX qty, by PIX code (across Top-20 items, 14 days)
--- Same top20 + pix_rollup logic as Step 3b, aggregated down to just the
--- UNMAPPED codes. These are transaction codes with no known posting path into
--- D365 that we can find in pacwmpixtransactionmappingtable or the other
--- known-mapped types (606/03, 620/pxaccd=03, 615/01, 605).
+-- Same top20 + pix_rollup logic as Step 3b, aggregated down to just the UNMAPPED
+-- codes. As of 2026-07-01: 618/55/03 (pick-short/inventory-variance) is the largest,
+-- hitting all 20 items — the leading candidate mechanism for the gap. 906/02 is
+-- second-largest and still completely undocumented; ask WM/Nedap what it represents.
 -- ============================================================================
-WITH latest_pxdcr AS (
-    SELECT MAX(pxdcr) AS max_pxdcr FROM dbo.pacwmcounts
-    WHERE IsDelete IS NULL AND inventlocationid IN ('4901','4905')
+WITH latest_journal_batch AS (
+    SELECT MAX(CAST(createddatetime AT TIME ZONE 'UTC' AT TIME ZONE 'Pacific Standard Time' AS DATE)) AS latest_night
+    FROM dbo.InventJournalTable
+    WHERE journalnameid = 'COU-DCSYNC' AND IsDelete IS NULL
 ),
-wm_net AS (
-    SELECT c.itemid, SUM(CAST(c.wmcount AS DECIMAL(18,4))) AS wm_qty
-    FROM dbo.pacwmcounts c CROSS JOIN latest_pxdcr lp
-    WHERE c.IsDelete IS NULL AND c.pxdcr = lp.max_pxdcr AND c.inventlocationid IN ('4901','4905')
-    GROUP BY c.itemid
-),
-d365_net AS (
-    SELECT s.itemid, SUM(s.physicalinvent) AS d365_qty
-    FROM dbo.inventsum s
-    JOIN dbo.inventdim sDim ON sDim.inventdimid = s.inventdimid AND sDim.dataareaid='1001'
-        AND sDim.IsDelete IS NULL AND sDim.inventlocationid IN ('4901','4905')
-    WHERE s.dataareaid='1001' AND s.IsDelete IS NULL
-    GROUP BY s.itemid
-),
-gap_by_item AS (
-    SELECT COALESCE(w.itemid, oh.itemid) COLLATE DATABASE_DEFAULT AS itemid,
-           SUM(ISNULL(w.wm_qty,0) - ISNULL(oh.d365_qty,0)) AS net_gap
-    FROM wm_net w
-    FULL OUTER JOIN d365_net oh ON w.itemid = oh.itemid
-    GROUP BY COALESCE(w.itemid, oh.itemid)
-    HAVING SUM(ISNULL(w.wm_qty,0) - ISNULL(oh.d365_qty,0)) <> 0
+item_net AS (
+    SELECT jtr.itemid COLLATE DATABASE_DEFAULT AS itemid, SUM(jtr.qty) AS net_qty
+    FROM dbo.InventJournalTrans jtr
+    INNER JOIN dbo.InventJournalTable jt ON jt.journalid = jtr.journalid AND jt.IsDelete IS NULL
+    INNER JOIN dbo.inventdim d ON d.inventdimid = jtr.inventdimid AND d.dataareaid='1001' AND d.IsDelete IS NULL
+    CROSS JOIN latest_journal_batch lb
+    WHERE jt.journalnameid = 'COU-DCSYNC'
+      AND CAST(jt.createddatetime AT TIME ZONE 'UTC' AT TIME ZONE 'Pacific Standard Time' AS DATE) = lb.latest_night
+      AND jtr.dataareaid='1001' AND jtr.IsDelete IS NULL
+      AND d.inventlocationid IN ('4901','4905')
+    GROUP BY jtr.itemid
 ),
 top20 AS (
-    SELECT TOP 20 itemid FROM gap_by_item ORDER BY ABS(net_gap) DESC
+    SELECT TOP 20 itemid FROM item_net ORDER BY ABS(net_qty) DESC
 ),
 pix_rollup AS (
     SELECT
@@ -319,42 +331,31 @@ ORDER BY total_qty DESC;
 -- ============================================================================
 -- STEP 4b: REPORT — ASN error qty for the Top-20 items (last 30 days)
 -- ============================================================================
-WITH latest_pxdcr AS (
-    SELECT MAX(pxdcr) AS max_pxdcr FROM dbo.pacwmcounts
-    WHERE IsDelete IS NULL AND inventlocationid IN ('4901','4905')
+WITH latest_journal_batch AS (
+    SELECT MAX(CAST(createddatetime AT TIME ZONE 'UTC' AT TIME ZONE 'Pacific Standard Time' AS DATE)) AS latest_night
+    FROM dbo.InventJournalTable
+    WHERE journalnameid = 'COU-DCSYNC' AND IsDelete IS NULL
 ),
-wm_net AS (
-    SELECT c.itemid, SUM(CAST(c.wmcount AS DECIMAL(18,4))) AS wm_qty
-    FROM dbo.pacwmcounts c CROSS JOIN latest_pxdcr lp
-    WHERE c.IsDelete IS NULL AND c.pxdcr = lp.max_pxdcr AND c.inventlocationid IN ('4901','4905')
-    GROUP BY c.itemid
-),
-d365_net AS (
-    SELECT s.itemid, SUM(s.physicalinvent) AS d365_qty
-    FROM dbo.inventsum s
-    JOIN dbo.inventdim sDim ON sDim.inventdimid = s.inventdimid AND sDim.dataareaid='1001'
-        AND sDim.IsDelete IS NULL AND sDim.inventlocationid IN ('4901','4905')
-    WHERE s.dataareaid='1001' AND s.IsDelete IS NULL
-    GROUP BY s.itemid
-),
-gap_by_item AS (
-    SELECT COALESCE(w.itemid, oh.itemid) COLLATE DATABASE_DEFAULT AS itemid,
-           SUM(ISNULL(w.wm_qty,0) - ISNULL(oh.d365_qty,0)) AS net_gap
-    FROM wm_net w
-    FULL OUTER JOIN d365_net oh ON w.itemid = oh.itemid
-    GROUP BY COALESCE(w.itemid, oh.itemid)
-    HAVING SUM(ISNULL(w.wm_qty,0) - ISNULL(oh.d365_qty,0)) <> 0
+item_net AS (
+    SELECT jtr.itemid COLLATE DATABASE_DEFAULT AS itemid, SUM(jtr.qty) AS net_qty
+    FROM dbo.InventJournalTrans jtr
+    INNER JOIN dbo.InventJournalTable jt ON jt.journalid = jtr.journalid AND jt.IsDelete IS NULL
+    INNER JOIN dbo.inventdim d ON d.inventdimid = jtr.inventdimid AND d.dataareaid='1001' AND d.IsDelete IS NULL
+    CROSS JOIN latest_journal_batch lb
+    WHERE jt.journalnameid = 'COU-DCSYNC'
+      AND CAST(jt.createddatetime AT TIME ZONE 'UTC' AT TIME ZONE 'Pacific Standard Time' AS DATE) = lb.latest_night
+      AND jtr.dataareaid='1001' AND jtr.IsDelete IS NULL
+      AND d.inventlocationid IN ('4901','4905')
+    GROUP BY jtr.itemid
 ),
 top20 AS (
-    SELECT TOP 20 itemid FROM gap_by_item ORDER BY ABS(net_gap) DESC
+    SELECT TOP 20 itemid FROM item_net ORDER BY ABS(net_qty) DESC
 )
 SELECT
-    e.itemid, e.colorid, e.sizeid,
-    e.errordescription,
+    e.itemid, e.colorid, e.sizeid, e.errordescription,
     COUNT(*)          AS error_count,
     SUM(e.asnqty)     AS total_error_qty,
-    MIN(e.createddatetime AT TIME ZONE 'UTC' AT TIME ZONE 'Pacific Standard Time') AS first_seen_pst,
-    MAX(e.createddatetime AT TIME ZONE 'UTC' AT TIME ZONE 'Pacific Standard Time') AS last_seen_pst
+    MIN(e.createddatetime AT TIME ZONE 'UTC' AT TIME ZONE 'Pacific Standard Time') AS first_seen_pst
 FROM dbo.pacasnerrortable e
 WHERE e.IsDelete IS NULL
   AND e.createddatetime >= DATEADD(DAY,-30,GETUTCDATE())
@@ -364,113 +365,75 @@ ORDER BY total_error_qty DESC;
 
 
 -- ============================================================================
--- STEP 4c: REPORT — Timing discrepancies: PIX receipt events (606/03 ASN scan)
--- vs PIX movement events (618 pick, 620/621 ship, 300 carton, 700 move) and
--- D365 PO receipt posting dates, for the Top-20 items.
--- NOTE: no literal PIX code named "GRS" was found in pacwmpixmessage or
--- pacwmdailysyncbucketmapping as of 2026-07-01 — this treats 606/03 (ASN
--- receipt scan) as the "goods receipt" event. Confirm/relabel if "GRS" refers
--- to something more specific in WM terminology.
+-- STEP 4c: REPORT — Timing discrepancy: days since each item's most recent PO
+-- receipt vs. cumulative CTN-TRANSFER volume posted since that receipt. This is
+-- the corrected replacement for an earlier version of this report that compared
+-- PIX event timestamps directly and concluded (wrongly) that all 20 items were a
+-- same-day artifact — see the file header notes above. A large
+-- ctn_transfer_qty_since_receipt relative to qty_on_last_receipt_date, accumulating
+-- over several days, is the actual pattern found on 2026-07-01.
 -- ============================================================================
-WITH latest_pxdcr AS (
-    SELECT MAX(pxdcr) AS max_pxdcr FROM dbo.pacwmcounts
-    WHERE IsDelete IS NULL AND inventlocationid IN ('4901','4905')
+WITH latest_journal_batch AS (
+    SELECT MAX(CAST(createddatetime AT TIME ZONE 'UTC' AT TIME ZONE 'Pacific Standard Time' AS DATE)) AS latest_night
+    FROM dbo.InventJournalTable
+    WHERE journalnameid = 'COU-DCSYNC' AND IsDelete IS NULL
 ),
-wm_net AS (
-    SELECT c.itemid, SUM(CAST(c.wmcount AS DECIMAL(18,4))) AS wm_qty
-    FROM dbo.pacwmcounts c CROSS JOIN latest_pxdcr lp
-    WHERE c.IsDelete IS NULL AND c.pxdcr = lp.max_pxdcr AND c.inventlocationid IN ('4901','4905')
-    GROUP BY c.itemid
-),
-d365_net AS (
-    SELECT s.itemid, SUM(s.physicalinvent) AS d365_qty
-    FROM dbo.inventsum s
-    JOIN dbo.inventdim sDim ON sDim.inventdimid = s.inventdimid AND sDim.dataareaid='1001'
-        AND sDim.IsDelete IS NULL AND sDim.inventlocationid IN ('4901','4905')
-    WHERE s.dataareaid='1001' AND s.IsDelete IS NULL
-    GROUP BY s.itemid
-),
-gap_by_item AS (
-    SELECT COALESCE(w.itemid, oh.itemid) COLLATE DATABASE_DEFAULT AS itemid,
-           SUM(ISNULL(w.wm_qty,0) - ISNULL(oh.d365_qty,0)) AS net_gap
-    FROM wm_net w
-    FULL OUTER JOIN d365_net oh ON w.itemid = oh.itemid
-    GROUP BY COALESCE(w.itemid, oh.itemid)
-    HAVING SUM(ISNULL(w.wm_qty,0) - ISNULL(oh.d365_qty,0)) <> 0
+item_net AS (
+    SELECT jtr.itemid COLLATE DATABASE_DEFAULT AS itemid, SUM(jtr.qty) AS net_qty
+    FROM dbo.InventJournalTrans jtr
+    INNER JOIN dbo.InventJournalTable jt ON jt.journalid = jtr.journalid AND jt.IsDelete IS NULL
+    INNER JOIN dbo.inventdim d ON d.inventdimid = jtr.inventdimid AND d.dataareaid='1001' AND d.IsDelete IS NULL
+    CROSS JOIN latest_journal_batch lb
+    WHERE jt.journalnameid = 'COU-DCSYNC'
+      AND CAST(jt.createddatetime AT TIME ZONE 'UTC' AT TIME ZONE 'Pacific Standard Time' AS DATE) = lb.latest_night
+      AND jtr.dataareaid='1001' AND jtr.IsDelete IS NULL
+      AND d.inventlocationid IN ('4901','4905')
+    GROUP BY jtr.itemid
 ),
 top20 AS (
-    SELECT TOP 20 itemid FROM gap_by_item ORDER BY ABS(net_gap) DESC
+    SELECT TOP 20 itemid FROM item_net ORDER BY ABS(net_qty) DESC
 ),
-pix_events AS (
-    SELECT
-        (p.pxstyl + '-' + p.pxssfx + '-' + p.pxcolr) COLLATE DATABASE_DEFAULT AS itemid,
-        CAST(CASE
-            WHEN p.pxtxtp='606' AND p.pxtxcd='03'                    THEN 'RECEIPT_SCAN'
-            WHEN p.pxtxtp IN ('618','620','621','300','700')          THEN 'MOVEMENT'
-            WHEN p.pxtxtp='605'                                       THEN 'DAILY_SYNC'
-            ELSE 'OTHER'
-        END AS VARCHAR(20)) COLLATE DATABASE_DEFAULT AS event_class,
-        p.createddatetime AT TIME ZONE 'UTC' AT TIME ZONE 'Pacific Standard Time' AS event_pst
-    FROM dbo.pacwmpixmessage p
-    WHERE p.IsDelete IS NULL
-      AND p.createddatetime >= DATEADD(DAY,-14,GETUTCDATE())
-      AND (p.pxstyl + '-' + p.pxssfx + '-' + p.pxcolr) COLLATE DATABASE_DEFAULT IN (SELECT itemid FROM top20)
+last_receipt AS (
+    SELECT t.itemid COLLATE DATABASE_DEFAULT AS itemid, MAX(t.datephysical) AS last_receipt_date
+    FROM dbo.inventtransorigin o
+    INNER JOIN dbo.inventtrans t ON t.inventtransorigin = o.recid AND t.dataareaid='1001'
+    INNER JOIN dbo.inventdim d ON d.inventdimid = t.inventdimid AND d.dataareaid='1001'
+    WHERE o.dataareaid='1001' AND o.IsDelete IS NULL AND t.IsDelete IS NULL
+      AND d.inventlocationid IN ('4901','4905') AND o.referencecategory = 3
+      AND t.itemid COLLATE DATABASE_DEFAULT IN (SELECT itemid FROM top20)
+    GROUP BY t.itemid
+),
+receipt_qty AS (
+    SELECT t.itemid COLLATE DATABASE_DEFAULT AS itemid, SUM(t.qty) AS qty_on_last_receipt_date
+    FROM dbo.inventtransorigin o
+    INNER JOIN dbo.inventtrans t ON t.inventtransorigin = o.recid AND t.dataareaid='1001'
+    INNER JOIN dbo.inventdim d ON d.inventdimid = t.inventdimid AND d.dataareaid='1001'
+    INNER JOIN last_receipt lr ON lr.itemid = t.itemid COLLATE DATABASE_DEFAULT AND t.datephysical = lr.last_receipt_date
+    WHERE o.dataareaid='1001' AND o.IsDelete IS NULL AND t.IsDelete IS NULL
+      AND d.inventlocationid IN ('4901','4905') AND o.referencecategory = 3
+    GROUP BY t.itemid
+),
+ctn_since_receipt AS (
+    SELECT jtr.itemid COLLATE DATABASE_DEFAULT AS itemid,
+           SUM(jtr.qty) AS ctn_transfer_qty_since_receipt,
+           COUNT(*) AS line_count
+    FROM dbo.InventJournalTrans jtr
+    INNER JOIN dbo.InventJournalTable jt ON jt.journalid = jtr.journalid AND jt.IsDelete IS NULL
+    INNER JOIN dbo.inventdim d ON d.inventdimid = jtr.inventdimid AND d.dataareaid='1001' AND d.IsDelete IS NULL
+    INNER JOIN last_receipt lr ON lr.itemid = jtr.itemid COLLATE DATABASE_DEFAULT
+    WHERE jt.journalnameid = 'CTN-TRANSFER' AND jtr.dataareaid='1001' AND jtr.IsDelete IS NULL
+      AND d.inventlocationid IN ('4901','4905')
+      AND jt.createddatetime >= CAST(lr.last_receipt_date AS DATETIME2)
+    GROUP BY jtr.itemid
 )
 SELECT
-    itemid, event_class,
-    COUNT(*)       AS event_count,
-    MIN(event_pst) AS first_event_pst,
-    MAX(event_pst) AS last_event_pst
-FROM pix_events
-WHERE event_class IN ('RECEIPT_SCAN','MOVEMENT','DAILY_SYNC')
-GROUP BY itemid, event_class
-ORDER BY itemid, event_class;
-
--- D365-side PO receipt dates for the same items, to compare against the WM RECEIPT_SCAN
--- timestamps above — if the PO receipt date is "today", the gap is very likely
--- TIMING_GAP (tonight's WM sync will close it), not a real structural gap.
-WITH latest_pxdcr AS (
-    SELECT MAX(pxdcr) AS max_pxdcr FROM dbo.pacwmcounts
-    WHERE IsDelete IS NULL AND inventlocationid IN ('4901','4905')
-),
-wm_net AS (
-    SELECT c.itemid, SUM(CAST(c.wmcount AS DECIMAL(18,4))) AS wm_qty
-    FROM dbo.pacwmcounts c CROSS JOIN latest_pxdcr lp
-    WHERE c.IsDelete IS NULL AND c.pxdcr = lp.max_pxdcr AND c.inventlocationid IN ('4901','4905')
-    GROUP BY c.itemid
-),
-d365_net AS (
-    SELECT s.itemid, SUM(s.physicalinvent) AS d365_qty
-    FROM dbo.inventsum s
-    JOIN dbo.inventdim sDim ON sDim.inventdimid = s.inventdimid AND sDim.dataareaid='1001'
-        AND sDim.IsDelete IS NULL AND sDim.inventlocationid IN ('4901','4905')
-    WHERE s.dataareaid='1001' AND s.IsDelete IS NULL
-    GROUP BY s.itemid
-),
-gap_by_item AS (
-    SELECT COALESCE(w.itemid, oh.itemid) COLLATE DATABASE_DEFAULT AS itemid,
-           SUM(ISNULL(w.wm_qty,0) - ISNULL(oh.d365_qty,0)) AS net_gap
-    FROM wm_net w
-    FULL OUTER JOIN d365_net oh ON w.itemid = oh.itemid
-    GROUP BY COALESCE(w.itemid, oh.itemid)
-    HAVING SUM(ISNULL(w.wm_qty,0) - ISNULL(oh.d365_qty,0)) <> 0
-),
-top20 AS (
-    SELECT TOP 20 itemid FROM gap_by_item ORDER BY ABS(net_gap) DESC
-)
-SELECT
-    t.itemid COLLATE DATABASE_DEFAULT AS itemid,
-    o.referenceid AS po_number,
-    MIN(t.datephysical) AS first_receipt_date,
-    MAX(t.datephysical) AS last_receipt_date,
-    SUM(t.qty) AS total_received_qty
-FROM dbo.inventtransorigin o
-INNER JOIN dbo.inventtrans t ON t.inventtransorigin = o.recid AND t.dataareaid='1001'
-INNER JOIN dbo.inventdim d ON d.inventdimid = t.inventdimid AND d.dataareaid='1001'
-WHERE o.dataareaid='1001' AND o.IsDelete IS NULL AND t.IsDelete IS NULL
-  AND d.inventlocationid IN ('4901','4905')
-  AND o.referencecategory = 3
-  AND t.itemid COLLATE DATABASE_DEFAULT IN (SELECT itemid FROM top20)
-  AND t.datephysical >= DATEADD(DAY,-30,GETUTCDATE())
-GROUP BY t.itemid, o.referenceid
-ORDER BY t.itemid;
+    lr.itemid,
+    lr.last_receipt_date,
+    rq.qty_on_last_receipt_date,
+    DATEDIFF(DAY, lr.last_receipt_date, GETUTCDATE())        AS days_since_receipt,
+    ISNULL(cs.ctn_transfer_qty_since_receipt, 0)             AS ctn_transfer_qty_since_receipt,
+    ISNULL(cs.line_count, 0)                                 AS ctn_transfer_lines_since_receipt
+FROM last_receipt lr
+LEFT JOIN receipt_qty rq ON rq.itemid = lr.itemid
+LEFT JOIN ctn_since_receipt cs ON cs.itemid = lr.itemid
+ORDER BY days_since_receipt;
