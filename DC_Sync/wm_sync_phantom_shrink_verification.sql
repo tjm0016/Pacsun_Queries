@@ -328,7 +328,13 @@ ORDER BY day_pst;
 -- ============================================================================
 -- Q10. ALLOCATION-WAVE CORRELATION + THE 6/26 SELF-REVERSAL (decisive proof)
 -- For every journal night in June: journal net vs same-day allocation and
--- receipt volume. Expected:
+-- receipt volume. Expected (all 13 June journal nights; 17 nights have no
+-- journals at all due to creation gaps and are unmeasured):
+--   6/7:  -83,418 <- CATCH-UP batch (10 journals) after the 6/1-6/6 creation
+--         outage: multiple stale snapshot files compared vs live D365. Same
+--         artifact family, triggered by staleness instead of flow surge.
+--   6/10: -13,471 (normal); 6/18: -30,043 <- first run after 7-day journal
+--         gap, catch-up flavor, elevated; 6/21: -10,778 (normal)
 --   6/22-6/25: alloc 198-233K/day -> journal nets only -2K..-9K (steady state:
 --              yesterday's staged wave invoices out as today's stages in)
 --   6/26: alloc 256,846 -> journal net -144,083   <- Friday wave staged, spike
@@ -337,6 +343,8 @@ ORDER BY day_pst;
 --         shipped/invoiced through the weekend. Real shrink cannot do this.
 --   6/29: alloc 171,958 -> journal net  -10,452   (weekend receipts aligned)
 --   6/30: alloc 317,821 -> journal net -113,199   <- month-end monster wave
+-- Among normal consecutive nightly runs, the only spikes are the two biggest
+-- allocation days; every elevated June night has an artifact explanation.
 -- Interpretation: the nightly journal net is a live gauge of the in-flight
 -- population (staged outbound + received-not-putaway), breathing with the
 -- allocation/receiving waves. It is not cumulative loss.
