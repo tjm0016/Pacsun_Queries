@@ -382,3 +382,107 @@ FROM nightly_journal j
 LEFT JOIN alloc a ON a.d = j.d
 LEFT JOIN rcpts r ON r.d = j.d
 ORDER BY j.d;
+
+
+-- ============================================================================
+-- Q11. COMPARISON-TIME SIMULATOR — models what a journal batch WOULD have
+-- computed at a different comparison time, using the frozen journal values
+-- plus CTN/MOV postings in the shift window. Used to evaluate the proposed
+-- "move journal creation to ~4 AM PT" fix.
+--
+-- RESULT FOR 6/30 (documented 2026-07-01) — PROPOSAL REJECTED:
+--   net:            -113,199 -> -104,022  (only 8% better)
+--   gross artifact:  136,369 ->  146,716  (7.6% WORSE)
+--   keys improved: 67   keys worsened: 511
+--   new reverse (found-direction) artifacts: 303 keys / +6,510 units
+--     (night-shift picks still in the snapshot but invoiced before 4 AM)
+-- WHY: DC-dim CTN-TRANSFER invoices post in waves at ~4-5 PM PT (same evening,
+-- BEFORE the current 10:36 PM journal) and ~12-1 PM PT the NEXT day; the
+-- 11 PM-4 AM window itself moves only ~-9.7K units at DC dims. The month-end
+-- staged freight took days to invoice — no comparison time captures it
+-- without also eating the next day's receipts. Conclusion: timing change is
+-- not the fix; use the ISS-01579 threshold guard + in-flight reconciliation.
+--
+-- To simulate other nights: change @journal_night and the window bounds
+-- (@win_start/@win_end are UTC; keep the end before ~11:00 UTC / 4 AM PT so
+-- receipts stay ~zero, otherwise the model must also include receipts).
+-- ============================================================================
+DECLARE @journal_night DATE = '2026-06-30';
+DECLARE @win_start DATETIME2 = '2026-07-01T06:00:00';  -- 11:00 PM PT 6/30 (UTC)
+DECLARE @win_end   DATETIME2 = '2026-07-01T11:00:00';  -- 4:00 AM PT 7/1  (UTC)
+
+WITH frozen AS (
+    SELECT jtr.itemid, jtr.inventdimid, SUM(jtr.qty) AS var_frozen
+    FROM dbo.InventJournalTrans jtr
+    INNER JOIN dbo.InventJournalTable jt ON jt.journalid = jtr.journalid AND jt.IsDelete IS NULL
+    WHERE jt.journalnameid='COU-DCSYNC' AND jtr.dataareaid='1001' AND jtr.IsDelete IS NULL
+      AND CAST(jt.createddatetime AT TIME ZONE 'UTC' AT TIME ZONE 'Pacific Standard Time' AS DATE)=@journal_night
+    GROUP BY jtr.itemid, jtr.inventdimid
+),
+window_moves AS (
+    SELECT jtr.itemid, jtr.inventdimid, SUM(jtr.qty) AS win_net
+    FROM dbo.InventJournalTrans jtr
+    INNER JOIN dbo.InventJournalTable jt ON jt.journalid = jtr.journalid AND jt.IsDelete IS NULL
+    INNER JOIN dbo.inventdim d ON d.inventdimid = jtr.inventdimid AND d.dataareaid='1001'
+    WHERE jt.journalnameid IN ('CTN-TRANSFER','MOV-DCADJ') AND jt.posted=1
+      AND jtr.dataareaid='1001' AND jtr.IsDelete IS NULL
+      AND d.inventlocationid IN ('4901','4902','4905')
+      AND jt.posteddatetime >= @win_start AND jt.posteddatetime < @win_end
+    GROUP BY jtr.itemid, jtr.inventdimid
+),
+combined AS (
+    SELECT COALESCE(f.itemid, w.itemid) AS itemid,
+        COALESCE(f.inventdimid, w.inventdimid) AS dimid,
+        ISNULL(f.var_frozen,0) AS var_frozen,
+        ISNULL(f.var_frozen,0) - ISNULL(w.win_net,0) AS var_simulated
+    FROM frozen f
+    FULL OUTER JOIN window_moves w ON w.itemid = f.itemid AND w.inventdimid = f.inventdimid
+),
+item_wh AS (
+    SELECT c.itemid, d.inventlocationid,
+        SUM(c.var_frozen) AS frozen_net, SUM(c.var_simulated) AS sim_net
+    FROM combined c
+    INNER JOIN dbo.inventdim d ON d.inventdimid = c.dimid AND d.dataareaid='1001'
+    GROUP BY c.itemid, d.inventlocationid
+)
+SELECT
+    COUNT(*)                                                        AS item_wh_keys,
+    SUM(frozen_net)                                                 AS total_frozen_net,
+    SUM(sim_net)                                                    AS total_simulated_net,
+    SUM(ABS(frozen_net))                                            AS abs_frozen,
+    SUM(ABS(sim_net))                                               AS abs_simulated,
+    SUM(CASE WHEN ABS(sim_net) < ABS(frozen_net) THEN 1 ELSE 0 END) AS keys_improved,
+    SUM(CASE WHEN ABS(sim_net) > ABS(frozen_net) THEN 1 ELSE 0 END) AS keys_worsened,
+    SUM(CASE WHEN frozen_net = 0 AND sim_net <> 0 THEN 1 ELSE 0 END) AS new_reverse_artifact_keys,
+    SUM(CASE WHEN frozen_net = 0 THEN ABS(sim_net) ELSE 0 END)      AS reverse_artifact_units
+FROM item_wh;
+
+
+-- ============================================================================
+-- Q12. DC-DIM CARTON-INVOICE POSTING RHYTHM — why no comparison time works
+-- CTN-TRANSFER net units AT DC DIMENSIONS by posted hour. Expected (6/30-7/1):
+--   6/30 16:00 PT: -13,288   6/30 17:00 PT: -21,335   <- same-evening waves,
+--        already posted BEFORE the current 10:36 PM journal
+--   7/1  03:00 PT:  -9,753   <- the entire overnight window moves this little
+--   7/1  12:00 PT: -15,746   7/1 13:00 PT: -40,483    <- next-day midday waves
+--        (to capture these you'd compare mid-afternoon — after ~100K+ of the
+--        day's receipts have posted; strictly worse)
+-- Note: large 00:00-03:00 "waves" appear in created-hour LINE counts, but most
+-- of those lines are not at DC dims and barely affect the DC comparison.
+-- ============================================================================
+SELECT
+    CAST(jt.posteddatetime AT TIME ZONE 'UTC' AT TIME ZONE 'Pacific Standard Time' AS DATE) AS day_pst,
+    DATEPART(HOUR, jt.posteddatetime AT TIME ZONE 'UTC' AT TIME ZONE 'Pacific Standard Time') AS hour_pst,
+    COUNT(DISTINCT jt.journalid) AS journals,
+    SUM(jtr.qty) AS net_units_dc_dims,
+    COUNT(*) AS lines
+FROM dbo.InventJournalTable jt
+INNER JOIN dbo.InventJournalTrans jtr ON jtr.journalid = jt.journalid
+    AND jtr.dataareaid='1001' AND jtr.IsDelete IS NULL
+INNER JOIN dbo.inventdim d ON d.inventdimid = jtr.inventdimid AND d.dataareaid='1001'
+WHERE jt.journalnameid='CTN-TRANSFER' AND jt.posted=1 AND jt.IsDelete IS NULL
+  AND d.inventlocationid IN ('4901','4902','4905')
+  AND jt.posteddatetime >= '2026-06-30T20:00:00'
+GROUP BY CAST(jt.posteddatetime AT TIME ZONE 'UTC' AT TIME ZONE 'Pacific Standard Time' AS DATE),
+    DATEPART(HOUR, jt.posteddatetime AT TIME ZONE 'UTC' AT TIME ZONE 'Pacific Standard Time')
+ORDER BY day_pst, hour_pst;
