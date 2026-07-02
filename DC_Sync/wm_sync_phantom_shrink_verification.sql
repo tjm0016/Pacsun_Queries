@@ -486,3 +486,32 @@ WHERE jt.journalnameid='CTN-TRANSFER' AND jt.posted=1 AND jt.IsDelete IS NULL
 GROUP BY CAST(jt.posteddatetime AT TIME ZONE 'UTC' AT TIME ZONE 'Pacific Standard Time' AS DATE),
     DATEPART(HOUR, jt.posteddatetime AT TIME ZONE 'UTC' AT TIME ZONE 'Pacific Standard Time')
 ORDER BY day_pst, hour_pst;
+
+
+-- ============================================================================
+-- Q13. MESSAGE-PROCESSING HEALTH — proves the lag is NOT in message processing
+-- O3 carton-invoice files, message-level: arrival (createddatetime) vs
+-- processed (statusdatetime), with status. MEASURED 6/29-7/2 (4,948 messages):
+--   100% status 40 (processed); wait minutes p50=2, p95=25, p99=27, max=174
+--   (one 2-message blip). WM creates invoices continuously (o3tcr stamps run
+--   ~1:40 AM-11:59 PM ET); SFTP+parse lands them in minutes-to-~3h; message
+--   processing clears them in ~2 minutes.
+-- THEREFORE the 12-18h lag between physical shipment and D365 on-hand update
+-- sits in ONE place: the batch that creates+posts CTN-TRANSFER (transit)
+-- journals from carton transfer data — it runs in ~2 daily waves (~4-5 PM PT
+-- and next-day ~noon PT, small 3 AM trickle; see Q12) instead of continuously.
+-- That job/schedule (cf. paccartontransitjournalpostmultitracking, empty in
+-- Synapse — check the D365 batch job directly) is the fix target.
+-- ============================================================================
+SELECT m.recid AS message_recid,
+    m.createddatetime AT TIME ZONE 'UTC' AT TIME ZONE 'Pacific Standard Time' AS arrived_pst,
+    m.statusdatetime  AT TIME ZONE 'UTC' AT TIME ZONE 'Pacific Standard Time' AS processed_pst,
+    m.messagestatus,
+    DATEDIFF(MINUTE, m.createddatetime, m.statusdatetime) AS wait_minutes,
+    COUNT(h.recid) AS carton_headers
+FROM dbo.sunintmessage m
+INNER JOIN dbo.pacwminvoicecartonheadermessage h ON h.message = m.recid AND h.IsDelete IS NULL
+WHERE m.IsDelete IS NULL
+  AND m.createddatetime >= DATEADD(DAY,-3,GETUTCDATE())
+GROUP BY m.recid, m.createddatetime, m.statusdatetime, m.messagestatus
+ORDER BY m.createddatetime;
