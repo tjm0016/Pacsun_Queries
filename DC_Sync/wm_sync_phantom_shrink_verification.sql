@@ -605,3 +605,33 @@ GROUP BY
         ELSE 'E_over_12h'
     END
 ORDER BY o4_lag_bucket;
+
+
+-- ============================================================================
+-- Q16. FINAL CORRECTION — STORE cartons vs PARCELS resolves everything.
+-- O3 arrivals split by ship-to presence (store carton) vs absent (parcel):
+--   STORE cartons arrive in ~2 daily batches (6/30: 13:00 PT 2,218 + 15:00 PT
+--   814; 7/1: 03:00 PT 1,340 + 12:00 PT 1,304) — trailer-close cadence at WM.
+--   PARCELS (e-comm, no ship-to) flow continuously all day — they never
+--   produce CTN-TRANSFER journals (e-comm relief posts via sales orders).
+-- DC journal creation follows each STORE batch within 0-3 hours (often the
+-- same hour). CONCLUSION: the D365 pipeline is prompt end-to-end; the
+-- twice-daily journal bursts mirror WM's store-carton invoice file cadence.
+-- The phantom shrink is therefore the PHYSICAL pick-to-trailer-close latency
+-- at WM (cartons leave counted buckets at pick; invoice cut at trailer
+-- close), amplified at month-end when freight is staged days ahead. No
+-- D365-side defect found. Mitigations: ISS-01579 threshold guard (primary);
+-- surge-aware posting policy; optionally discuss with WM whether store-carton
+-- invoices (or a staged-carton feed) can be sent closer to pick time.
+-- ============================================================================
+SELECT
+    CAST(h.createddatetime AT TIME ZONE 'UTC' AT TIME ZONE 'Pacific Standard Time' AS DATE) AS day_pst,
+    DATEPART(HOUR, h.createddatetime AT TIME ZONE 'UTC' AT TIME ZONE 'Pacific Standard Time') AS hr_pst,
+    SUM(CASE WHEN ISNULL(h.o3shto,'') <> '' THEN 1 ELSE 0 END) AS store_cartons,
+    SUM(CASE WHEN ISNULL(h.o3shto,'') = ''  THEN 1 ELSE 0 END) AS parcel_cartons
+FROM dbo.pacwminvoicecartonheadermessage h
+WHERE h.IsDelete IS NULL
+  AND h.createddatetime >= DATEADD(DAY,-3,GETUTCDATE())
+GROUP BY CAST(h.createddatetime AT TIME ZONE 'UTC' AT TIME ZONE 'Pacific Standard Time' AS DATE),
+    DATEPART(HOUR, h.createddatetime AT TIME ZONE 'UTC' AT TIME ZONE 'Pacific Standard Time')
+ORDER BY day_pst, hr_pst;
