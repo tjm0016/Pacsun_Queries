@@ -323,3 +323,54 @@ FULL OUTER JOIN daily_receipts r ON r.d = j.d
 FULL OUTER JOIN daily_ctn c ON c.d = COALESCE(j.d, r.d)
 FULL OUTER JOIN daily_alloc a ON a.d = COALESCE(j.d, r.d, c.d)
 ORDER BY day_pst;
+
+
+-- ============================================================================
+-- Q10. ALLOCATION-WAVE CORRELATION + THE 6/26 SELF-REVERSAL (decisive proof)
+-- For every journal night in June: journal net vs same-day allocation and
+-- receipt volume. Expected:
+--   6/22-6/25: alloc 198-233K/day -> journal nets only -2K..-9K (steady state:
+--              yesterday's staged wave invoices out as today's stages in)
+--   6/26: alloc 256,846 -> journal net -144,083   <- Friday wave staged, spike
+--   6/27: alloc  54,938 -> journal net   -8,668   <- SELF-REVERSED overnight:
+--         no counting journal posted in between; the staged wave simply
+--         shipped/invoiced through the weekend. Real shrink cannot do this.
+--   6/29: alloc 171,958 -> journal net  -10,452   (weekend receipts aligned)
+--   6/30: alloc 317,821 -> journal net -113,199   <- month-end monster wave
+-- Interpretation: the nightly journal net is a live gauge of the in-flight
+-- population (staged outbound + received-not-putaway), breathing with the
+-- allocation/receiving waves. It is not cumulative loss.
+-- ============================================================================
+WITH nightly_journal AS (
+    SELECT CAST(jt.createddatetime AT TIME ZONE 'UTC' AT TIME ZONE 'Pacific Standard Time' AS DATE) AS d,
+        SUM(jtr.qty) AS journal_net
+    FROM dbo.InventJournalTable jt
+    INNER JOIN dbo.InventJournalTrans jtr ON jtr.journalid = jt.journalid
+        AND jtr.dataareaid='1001' AND jtr.IsDelete IS NULL
+    WHERE jt.journalnameid='COU-DCSYNC' AND jt.IsDelete IS NULL
+      AND jt.createddatetime >= '2026-06-01T00:00:00'
+    GROUP BY CAST(jt.createddatetime AT TIME ZONE 'UTC' AT TIME ZONE 'Pacific Standard Time' AS DATE)
+),
+alloc AS (
+    SELECT CAST(SinkCreatedOn AS DATE) AS d, SUM(allocatedquantity) AS alloc_units
+    FROM dbo.pacAllocationDataLine
+    WHERE SinkCreatedOn >= '2026-06-01'
+    GROUP BY CAST(SinkCreatedOn AS DATE)
+),
+rcpts AS (
+    SELECT CAST(t.datephysical AS DATE) AS d, SUM(t.qty) AS receipt_units
+    FROM dbo.inventtransorigin o
+    INNER JOIN dbo.inventtrans t ON t.inventtransorigin = o.recid AND t.dataareaid='1001'
+    INNER JOIN dbo.inventdim dd ON dd.inventdimid = t.inventdimid AND dd.dataareaid='1001'
+    WHERE o.dataareaid='1001' AND o.IsDelete IS NULL AND t.IsDelete IS NULL
+      AND dd.inventlocationid IN ('4901','4902','4905') AND o.referencecategory = 3
+      AND t.datephysical >= '2026-06-01'
+    GROUP BY CAST(t.datephysical AS DATE)
+)
+SELECT j.d AS journal_night, j.journal_net,
+    a.alloc_units AS allocated_same_day,
+    r.receipt_units AS received_same_day
+FROM nightly_journal j
+LEFT JOIN alloc a ON a.d = j.d
+LEFT JOIN rcpts r ON r.d = j.d
+ORDER BY j.d;
