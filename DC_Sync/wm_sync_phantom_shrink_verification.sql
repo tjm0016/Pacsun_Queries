@@ -264,8 +264,18 @@ ORDER BY posting_window, receipt_date;
 
 -- ============================================================================
 -- Q9. ONGOING MONITOR — nightly journal net vs same-day flow volume
--- Run any time. If |journal net| tracks receipt volume + CTN volume, the
+-- Run any time. If |journal net| tracks allocation + receipt volume, the
 -- shrink is flow artifact, not loss. Watch it normalize after quarter-end.
+-- VALIDATED 2026-07-01: the two shrink spikes align with the two biggest
+-- allocation days of the month, and the 6/26 spike SELF-REVERSED overnight:
+--   6/22-6/25: alloc 198-233K/day -> journal nets only -2K..-9K (steady state)
+--   6/26: alloc 256,846 -> journal net -144,083   <- spike
+--   6/27: alloc  54,938 -> journal net   -8,668   <- reversed itself; no
+--         journal was posted in between. Real shrink cannot do this.
+--   6/29: alloc 171,958 -> journal net  -10,452
+--   6/30: alloc 317,821 -> journal net -113,199   <- month-end monster wave
+-- Nightly journal net ~= -(in-flight population at snapshot) which breathes
+-- with the allocation/receiving waves.
 -- ============================================================================
 WITH nightly_journal AS (
     SELECT CAST(jt.createddatetime AT TIME ZONE 'UTC' AT TIME ZONE 'Pacific Standard Time' AS DATE) AS d,
@@ -296,12 +306,20 @@ daily_ctn AS (
     WHERE jt.journalnameid='CTN-TRANSFER' AND jt.IsDelete IS NULL
       AND jt.createddatetime >= DATEADD(DAY,-21,GETUTCDATE())
     GROUP BY CAST(jt.createddatetime AT TIME ZONE 'UTC' AT TIME ZONE 'Pacific Standard Time' AS DATE)
+),
+daily_alloc AS (
+    SELECT CAST(SinkCreatedOn AS DATE) AS d, SUM(allocatedquantity) AS alloc_units
+    FROM dbo.pacAllocationDataLine
+    WHERE SinkCreatedOn >= DATEADD(DAY,-21,GETUTCDATE())
+    GROUP BY CAST(SinkCreatedOn AS DATE)
 )
-SELECT COALESCE(j.d, r.d, c.d) AS day_pst,
+SELECT COALESCE(j.d, r.d, c.d, a.d) AS day_pst,
     j.journal_net_units,
+    a.alloc_units       AS allocated_units,
     r.receipt_units,
     c.ctn_net_units
 FROM nightly_journal j
 FULL OUTER JOIN daily_receipts r ON r.d = j.d
 FULL OUTER JOIN daily_ctn c ON c.d = COALESCE(j.d, r.d)
+FULL OUTER JOIN daily_alloc a ON a.d = COALESCE(j.d, r.d, c.d)
 ORDER BY day_pst;
