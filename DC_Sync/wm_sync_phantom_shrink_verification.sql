@@ -635,3 +635,48 @@ WHERE h.IsDelete IS NULL
 GROUP BY CAST(h.createddatetime AT TIME ZONE 'UTC' AT TIME ZONE 'Pacific Standard Time' AS DATE),
     DATEPART(HOUR, h.createddatetime AT TIME ZONE 'UTC' AT TIME ZONE 'Pacific Standard Time')
 ORDER BY day_pst, hr_pst;
+
+
+-- ============================================================================
+-- Q17. FROZEN-GAP x ASN-ERROR WORK LIST — the real reconciliation queue.
+-- Items whose COU-DCSYNC variance is IDENTICAL (+/- 5 units) across the two
+-- most recent journal nights are "frozen" — flow artifacts breathe, frozen
+-- gaps don't. Cross-referencing open ASN errors flags receipts that likely
+-- cannot post until the error is worked (e.g. 0131-45421-0179: +4,998 frozen
+-- on both 6/30 and 7/1 with missing-items + duplicate-ASN errors).
+-- Run WEEKLY; work the list top-down. Rows with asn_errors > 0 first.
+-- ============================================================================
+WITH nights AS (
+    SELECT DISTINCT TOP 2 CAST(jt.createddatetime AT TIME ZONE 'UTC' AT TIME ZONE 'Pacific Standard Time' AS DATE) AS d
+    FROM dbo.InventJournalTable jt
+    WHERE jt.journalnameid='COU-DCSYNC' AND jt.IsDelete IS NULL
+    ORDER BY d DESC
+),
+per_night AS (
+    SELECT jtr.itemid COLLATE DATABASE_DEFAULT AS itemid,
+        CAST(jt.createddatetime AT TIME ZONE 'UTC' AT TIME ZONE 'Pacific Standard Time' AS DATE) AS d,
+        SUM(jtr.qty) AS net_qty
+    FROM dbo.InventJournalTrans jtr
+    INNER JOIN dbo.InventJournalTable jt ON jt.journalid = jtr.journalid AND jt.IsDelete IS NULL
+    WHERE jt.journalnameid='COU-DCSYNC' AND jtr.dataareaid='1001' AND jtr.IsDelete IS NULL
+      AND CAST(jt.createddatetime AT TIME ZONE 'UTC' AT TIME ZONE 'Pacific Standard Time' AS DATE) IN (SELECT d FROM nights)
+    GROUP BY jtr.itemid, CAST(jt.createddatetime AT TIME ZONE 'UTC' AT TIME ZONE 'Pacific Standard Time' AS DATE)
+),
+frozen AS (
+    SELECT a.itemid, MAX(a.net_qty) AS latest_gap
+    FROM per_night a
+    GROUP BY a.itemid
+    HAVING COUNT(DISTINCT a.d) = 2
+       AND MAX(a.net_qty) - MIN(a.net_qty) BETWEEN -5 AND 5
+       AND ABS(MAX(a.net_qty)) >= 50            -- materiality floor; adjust
+)
+SELECT f.itemid, f.latest_gap,
+    COUNT(e.recid) AS asn_errors,
+    MAX(e.errordescription) AS sample_error,
+    MAX(e.purchid) AS sample_po
+FROM frozen f
+LEFT JOIN dbo.pacasnerrortable e
+    ON e.itemid COLLATE DATABASE_DEFAULT = f.itemid AND e.IsDelete IS NULL
+    AND e.createddatetime >= DATEADD(DAY,-45,GETUTCDATE())
+GROUP BY f.itemid, f.latest_gap
+ORDER BY CASE WHEN COUNT(e.recid) > 0 THEN 0 ELSE 1 END, ABS(f.latest_gap) DESC;
