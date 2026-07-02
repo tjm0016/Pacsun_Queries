@@ -515,3 +515,37 @@ WHERE m.IsDelete IS NULL
   AND m.createddatetime >= DATEADD(DAY,-3,GETUTCDATE())
 GROUP BY m.recid, m.createddatetime, m.statusdatetime, m.messagestatus
 ORDER BY m.createddatetime;
+
+
+-- ============================================================================
+-- Q14. CARTON LIFECYCLE vs THE INVENTORY MOVE — status flips are prompt, the
+-- posting is not. Lifecycle: Created (0) -> In Transit (1/2) -> Received at
+-- store (4). DC inventory is relieved at the created->in-transit POSTING;
+-- store completion is not required (design rule). Note: header/line records
+-- are created when EITHER the O3 or O4 file arrives (the pair can arrive out
+-- of sequence), so status-0 rows without ship dates are often just waiting
+-- for their counterpart file - not stuck.
+-- MEASURED 2026-07-02: cartons reach status 1 within ~1h of row creation
+-- (e.g. created 6:16 AM PT, In Transit by 7:14 AM), but the CTN-TRANSFER
+-- journals that actually relieve 4901 post in ~2 daily waves (Q12) —
+-- cartons can show In Transit for hours-to-a-day while D365 still carries
+-- their stock at the DC. movementfeference is EMPTY in this flow (0 of
+-- 5,794 recent cartons), so per-carton journal coupling must be checked in
+-- D365 directly (open a status-1 carton; find its transit journal).
+-- ============================================================================
+-- 14a. Status distribution for recently created cartons
+SELECT cartonstatus, COUNT(*) AS cartons,
+    SUM(CASE WHEN shippeddatetime > '1990-01-01' THEN 1 ELSE 0 END) AS has_ship_dt,
+    SUM(CASE WHEN ISNULL(movementfeference,'') <> '' THEN 1 ELSE 0 END) AS has_movement_ref
+FROM dbo.paccartontransferheader
+WHERE IsDelete IS NULL AND createddatetime >= DATEADD(DAY,-3,GETUTCDATE())
+GROUP BY cartonstatus ORDER BY cartonstatus;
+
+-- 14b. Sample recent in-transit cartons: row creation vs last status touch
+SELECT TOP 20 h.cartonnumber, h.cartonstatus, h.fromwh, h.towh,
+    h.createddatetime AT TIME ZONE 'UTC' AT TIME ZONE 'Pacific Standard Time' AS row_created_pst,
+    h.SinkModifiedOn  AT TIME ZONE 'UTC' AT TIME ZONE 'Pacific Standard Time' AS last_modified_pst
+FROM dbo.paccartontransferheader h
+WHERE h.IsDelete IS NULL AND h.cartonstatus IN (1,2)
+  AND h.createddatetime >= DATEADD(DAY,-2,GETUTCDATE())
+ORDER BY h.createddatetime DESC;
