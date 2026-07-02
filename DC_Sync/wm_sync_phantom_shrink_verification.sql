@@ -549,3 +549,59 @@ FROM dbo.paccartontransferheader h
 WHERE h.IsDelete IS NULL AND h.cartonstatus IN (1,2)
   AND h.createddatetime >= DATEADD(DAY,-2,GETUTCDATE())
 ORDER BY h.createddatetime DESC;
+
+
+-- ============================================================================
+-- Q15. O3<->O4 PAIR-COMPLETION LAG + BATCH-JOB EXONERATION (correction to
+-- the Q13/Q14 framing above). D365 batch history (user-verified 2026-07-02)
+-- shows BOTH jobs — "Carton Move to In Transit" (5637370333) and "Carton
+-- transfer journal posting-SVC" (5637749086) — run every 15 minutes, all
+-- Ended, 3-30 second durations. The schedule is NOT the bottleneck.
+-- Pair completion measured (O3s parsed 6/30-7/1, ~41K cartons):
+--   <=15 min: 33,331 (81%; O4 arrived BEFORE O3 for 14,777 of these —
+--             out-of-sequence arrival is routine and handled)
+--   15-60 min: 5,809   1-4h: 1,490   >4h: 0   no O4 yet: 728 (1.7%)
+-- YET journal creation stalls in multi-hour windows (7/1 04:00-11:00 PT:
+-- zero CTN journals created anywhere) and then bursts. With schedule,
+-- messages, and pairing all healthy, the gate is the WORK-SELECTION /
+-- ELIGIBILITY logic inside the carton processing code (candidates: load/
+-- trailer/pickticket-level completeness via o3ldno/o3mbol/o3pktn, transfer-
+-- order readiness). Fix path: read the X++ selection criteria and trace one
+-- carton whose O3+O4 both arrived by ~5 AM PT 7/1 but whose journal was not
+-- created until ~12 PM PT.
+-- ============================================================================
+WITH o3 AS (
+    SELECT o3casn AS casn, MIN(createddatetime) AS o3_arrived
+    FROM dbo.pacwminvoicecartonheadermessage
+    WHERE IsDelete IS NULL AND createddatetime >= DATEADD(DAY,-3,GETUTCDATE())
+    GROUP BY o3casn
+),
+o4 AS (
+    SELECT o4casn AS casn, MIN(createddatetime) AS o4_arrived
+    FROM dbo.pacwminvoicecartonlinemessage
+    WHERE IsDelete IS NULL AND createddatetime >= DATEADD(DAY,-4,GETUTCDATE())
+    GROUP BY o4casn
+)
+SELECT
+    CASE
+        WHEN o4.casn IS NULL THEN 'X_no_O4_yet'
+        WHEN DATEDIFF(MINUTE, o3.o3_arrived, o4.o4_arrived) <= 15 THEN 'A_within_15min'
+        WHEN DATEDIFF(MINUTE, o3.o3_arrived, o4.o4_arrived) <= 60 THEN 'B_15-60min'
+        WHEN DATEDIFF(MINUTE, o3.o3_arrived, o4.o4_arrived) <= 240 THEN 'C_1-4h'
+        WHEN DATEDIFF(MINUTE, o3.o3_arrived, o4.o4_arrived) <= 720 THEN 'D_4-12h'
+        ELSE 'E_over_12h'
+    END AS o4_lag_bucket,
+    COUNT(*) AS cartons,
+    SUM(CASE WHEN o4.o4_arrived < o3.o3_arrived THEN 1 ELSE 0 END) AS o4_arrived_before_o3
+FROM o3
+LEFT JOIN o4 ON o4.casn = o3.casn
+GROUP BY
+    CASE
+        WHEN o4.casn IS NULL THEN 'X_no_O4_yet'
+        WHEN DATEDIFF(MINUTE, o3.o3_arrived, o4.o4_arrived) <= 15 THEN 'A_within_15min'
+        WHEN DATEDIFF(MINUTE, o3.o3_arrived, o4.o4_arrived) <= 60 THEN 'B_15-60min'
+        WHEN DATEDIFF(MINUTE, o3.o3_arrived, o4.o4_arrived) <= 240 THEN 'C_1-4h'
+        WHEN DATEDIFF(MINUTE, o3.o3_arrived, o4.o4_arrived) <= 720 THEN 'D_4-12h'
+        ELSE 'E_over_12h'
+    END
+ORDER BY o4_lag_bucket;
