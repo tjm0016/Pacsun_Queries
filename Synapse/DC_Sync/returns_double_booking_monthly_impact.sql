@@ -94,6 +94,47 @@ WHERE jt.dataareaid='1001' AND jt.journalnameid='COU-DCSYNC' AND jt.posted=1
   AND jl.transdate >= @from AND jl.transdate < @to
 GROUP BY dj.inventlocationid ORDER BY net_cost;
 
+/*  ============ OVERSELL / CUSTOMER-IMPACT CHECK (2026-08-07) ============
+    Question: during 7/14-7/28, D365 Active ran 8-10x WM's count on high-return styles.
+    Did that overstatement cause oversells, short-ships, or cancellations?  ANSWER: no evidence.
+
+    (O1) 4905 July salesline: 882,868 lines | 755,075 qty | remainsalesphysical = 0 |
+         lines with remaining = 0  -> every ecom line fully shipped, nothing stranded.
+    (O2) ALL 4905 salesline are salesstatus=3 (Invoiced). Chain-wide July: only 16,147 status-1
+         vs 4,112,502 status-3. D365 receives ecom sales POST-fulfillment and never holds an open
+         ecom order => D365 is a downstream book of record, NOT the availability/promise engine.
+    (O3) Shipping volume ROSE through the outage: 7/14 43,227u, 7/22 36,362u,
+         7/27 52,958u (month's biggest day), 7/28 41,941u. No fulfillment collapse.
+         (Tiny days 7/5, 7/12, 7/19, 8/2 = Sunday posting cadence, not outages.)
+    (O4) No shortage signal: 618/55 verification variance flat 840-2,150/day before/during/after;
+         ZERO 618/45 (Picking De-Allocation/Shortage) and zero shortage action codes in Jun-Jul.
+
+    CAVEAT: O1 is partly structural -- if lines arrive already invoiced, remainsalesphysical is 0
+    by construction, so a failed order would never appear in D365 at all. Definitively ruling out
+    oversell requires the ecom/OMS (SFCC/MAO) availability feed source, which is NOT in D365
+    Synapse. Logic favors no exposure (WM held the correct count throughout and does the picking),
+    but confirm which system feeds ecom ATP before declaring this closed.
+*/
+
+-- (O1) Any ecom line left unshipped at 4905?
+SELECT COUNT(*) AS lines, SUM(sl.qtyordered) AS qty_ordered,
+       SUM(sl.remainsalesphysical) AS remain_unshipped,
+       SUM(CASE WHEN sl.remainsalesphysical<>0 THEN 1 ELSE 0 END) AS lines_with_remaining
+FROM salesline sl
+JOIN inventdim d ON d.inventdimid=sl.inventdimid AND d.dataareaid=sl.dataareaid
+WHERE sl.dataareaid='1001' AND d.inventlocationid='4905'
+  AND sl.createddatetime >= @from AND sl.createddatetime < @to;
+
+-- (O3) Daily shipped units at 4905 -- look for a collapse during the outage window (there isn't one).
+SELECT CONVERT(date, t.datephysical) AS d, COUNT(*) AS lines,
+       SUM(CASE WHEN t.qty<0 THEN -t.qty ELSE 0 END) AS units_shipped
+FROM inventtrans t
+JOIN inventdim d ON d.inventdimid=t.inventdimid AND d.dataareaid=t.dataareaid
+JOIN inventtransorigin o ON o.recid=t.inventtransorigin AND o.dataareaid=t.dataareaid
+WHERE t.dataareaid='1001' AND d.inventlocationid='4905' AND o.referencecategory=0
+  AND t.datephysical >= @from AND t.datephysical < @to
+GROUP BY CONVERT(date, t.datephysical) ORDER BY d;
+
 -- (Z) The one legitimate return booking, for comparison against the 604/606 unit counts.
 SELECT COUNT(*) AS lines, SUM(t.qty) AS return_units
 FROM inventtrans t
