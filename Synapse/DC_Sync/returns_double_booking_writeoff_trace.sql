@@ -32,8 +32,17 @@
   (unlock, +20 each) carry the SAME pxtran — one physical event posted twice.
   When both legs double, it washes; when only one leg posts (7/15) it strands +40.
 
-  FIX CANDIDATES: remove 604/02 (or 606/04) from pacwmpixtransactionmappingtable, and
-  dedupe 3xx/6xx pairs sharing pacwmpxtran; then returns book once and daily sync noise drops.
+  OVER/SHORT NOTE (verified): the ISS-00860 logic IS live — 606/02 lines whose ref 25 carries an
+  isOverShort lock code (LC/LW/MS only, per pacwmlockcodereference) post SIGN-INVERTED vs PXINAT
+  (A into LC -> negative write-off). "Ignore" applies only to 608-12 moves between two over/short
+  locations. The returns pair rides ref25=PP (Pending Putaway, overshort=0) — unaffected.
+  Second defect: the 3xx twin (300/01/19-20, same pxtran, BLANK ref 25) posts plainly, so on
+  over/short lock events the twins land SAME-signed (-20 + -20) = double the intended write-off,
+  instead of cancelling.
+
+  FIX CANDIDATES: returns — remove 604/02 (or 606/04) from pacwmpixtransactionmappingtable so a
+  return books once. Over/short lock events — suppress the 3xx twin (it can't see the lock code)
+  and keep the inverted 6xx leg. Do NOT blanket-dedupe 3xx/6xx by pxtran.
 
   Synapse serverless, DB dataverse_psprod_unq1fedfd537528f111a7e5000d3a5cc, dataareaid 1001.
 */
