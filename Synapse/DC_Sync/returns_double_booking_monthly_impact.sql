@@ -27,17 +27,33 @@
       4905 : 96,899 lines | -173,902 units | -$2,101,990
       4901 : 28,652 lines |  +86,609 units | +$1,125,459
 
-  ============ CONCLUSION ============
-  Phantom units at 4905 the sync had to remove in July:
-    conservative (1 redundant returns leg):  72,397 + 24,041 =  96,438 u / $1,235,242 = 55% of units, 59% of $
-    if BOTH PIX return legs are redundant : 144,794 + 24,041 = 168,835 u / $2,144,897 = 97% of units, ~100% of $
-  i.e. essentially the ENTIRE monthly 4905 sync write-off is these two defects.
+  ============ CONCLUSION (revised after audit 2026-08-07) ============
+  Attribution of the 4905 July sync write-off (-173,902 units), keep these SEPARATE:
+    duplicate PIX leg (the mapping defect) .... 72,397 u = 42%   <- what the fix removes
+    rc=0 return receipt into Active ........... 67,592 u = 39%   <- bucket double-count, fix does NOT address
+    returns TOTAL ............................ 139,989 u = 80%
+    other variance (in-flight etc.) ........... ~33,900 u = 20%
+  An earlier version of this file claimed "if BOTH legs are redundant = 97% of the write-off."
+  That was WRONG -- leg 2 corresponds to a REAL returned unit WM also counted into Lock_Code.
 
   NOTE ON MATERIALITY: this is not $1-2M of lost value. Phantom units are created by MOV-DCADJ and
-  removed by the sync, so the two largely offset in the GL. The real costs are (a) gross churn through
-  the inventory-adjustment accounts, (b) inventory overstatement in the window between creation and
-  the sync removal (1 day normally, ~2 weeks during the 7/14-7/28 outage), and (c) the resulting
-  catch-up journal reading as a large shrink event to finance.
+  removed by the sync, so the two largely offset. The real costs are (a) churn through the
+  inventory-adjustment accounts, (b) inventory overstatement between creation and sync removal
+  (1 day normally, ~2 weeks during the 7/14-7/28 outage), and (c) the catch-up journal reading as
+  a large shrink event to finance.
+
+  ** GL DOLLAR ATTRIBUTION IS NOT RELIABLE -- DO NOT QUOTE TO FINANCE **
+  Account identification is solid (MOV-DCADJ -> 505000 "Realized Shrink - Inventory Counts";
+  COU-DCSYNC -> 505840 "DC to ERP over/short variances"; both vs 102000 "Inventory subledger",
+  verified line-by-line on VOU-00537878 / VOU-00549213). But magnitudes do not tie:
+    - MOV-DCADJ at 4905 July = +$11,674,451 inventory value (returns pair is only $1,819,309 of it)
+      vs 505000 @ch74905 = -$1,785,350.  Gap ~$9.9M.
+    - COU-DCSYNC at 4905 July = -$2,101,990 vs 505840 @ch74905 = +$610,861.  Gap ~$1.5M.
+  Candidates: financial channel != warehouse 1:1; costamount != posted GL amount; more offset
+  accounts than the two sampled. Reconcile before using any dollar figure from this section.
+
+  T-SQL GOTCHA: `WHERE a AND b AND x LIKE '..' OR y LIKE '..'` -- AND binds tighter than OR, so the
+  OR branch silently drops the date filter. Parenthesize the OR group.
 */
 
 DECLARE @from DATE = '2026-07-01', @to DATE = '2026-08-01';
