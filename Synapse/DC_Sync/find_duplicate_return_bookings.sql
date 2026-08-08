@@ -6,9 +6,16 @@
      +1 Active     rc=0 return sales-order receipt        <- the only correct booking
      +1 Lock_Code  PIX 604/02 "Returns Acknowledgement SKU Detail"   -> MOV-DCADJ
      +1 Lock_Code  PIX 606/04 "Returns: Unallocatable Inventory"     -> MOV-DCADJ
-  604/02 and 606/04 are the SAME WM event: identical RMA in pacwmpxcasn and
+  604/02 and 606/04 are the SAME WM event: identical case number in pacwmpxcasn and
   CONSECUTIVE pacwmpxtran numbers. Both have rows in pacwmpixtransactionmappingtable
-  so INT-00374 creates a movement-journal line for each => +2 phantom units per return.
+  so INT-00374 creates a movement-journal line for each => the return quantity is
+  booked TWICE (+2 phantom units for the typical 1-unit return case).
+
+  FIELD NOTE: pacwmpxcasn is the WM CASE NUMBER (copybook PXSTYL: PXCASN ->
+  PIXBridge/PIX/PIXFields/CaseNumber, "the case # for which the PIX is generated"),
+  NOT an RMA. Returns use an 'R'-prefixed case series. Empirically 99.06% of return
+  cases hold exactly 1 unit (July 2026: 70,711 of 71,386; max observed 41), so counting
+  distinct cases approximates counting returned units -- but they are not the same thing.
   The nightly COU-DCSYNC counting journal deletes the phantoms, which is why this is
   invisible until the sync pauses (see 7/14-7/28 outage -> the 7/29 catch-up write-off).
 
@@ -40,7 +47,7 @@ SELECT
     dj.inventsizeid                                           AS size,
     dj.inventlocationid                                       AS warehouse,
     dj.wmslocationid                                          AS bucket,
-    jl.pacwmpxcasn                                            AS rma,
+    jl.pacwmpxcasn                                            AS case_number,   -- WM case/LPN (NOT an RMA)
     -- the two PIX messages that are really one event
     MAX(CASE WHEN jl.pacwmpxtxtp = '604' THEN jl.pacwmpxtxtp + '/' + jl.pacwmpxtxcd END) AS pix_leg_1,
     MAX(CASE WHEN jl.pacwmpxtxtp = '604' THEN jl.pacwmpxtran END)                        AS pix_tran_1,
@@ -80,7 +87,7 @@ SELECT
     jl.pacwmpxtxcd                                            AS pix_code,
     jl.pacwmpxaccd                                            AS pix_action_code,
     jl.pacwmpxtran                                            AS pix_tran_number,
-    jl.pacwmpxcasn                                            AS rma,
+    jl.pacwmpxcasn                                            AS case_number,   -- WM case/LPN (NOT an RMA)
     dj.inventlocationid                                       AS warehouse,
     dj.wmslocationid                                          AS bucket,
     jl.qty                                                    AS units,
@@ -108,7 +115,7 @@ SELECT
     CONVERT(date, jl.transdate)           AS trans_date,
     CONVERT(date, jt.posteddatetime)      AS posted_date,
     jt.posted                             AS is_posted,
-    COUNT(DISTINCT jl.pacwmpxcasn)        AS returns_duplicated,
+    COUNT(DISTINCT jl.pacwmpxcasn)        AS cases_duplicated,   -- WM cases, ~1 unit each
     COUNT(DISTINCT jl.itemid)             AS items,
     SUM(CASE WHEN jl.pacwmpxtxtp = '604' THEN jl.qty ELSE 0 END) AS qty_604_02,
     SUM(CASE WHEN jl.pacwmpxtxtp = '606' THEN jl.qty ELSE 0 END) AS qty_606_04,
