@@ -48,6 +48,42 @@
       -> InventTransOrigin and InventTrans are both GONE. Original ordered qty
       must come from Robling Snowflake F_ORD_QTY instead
       (see Snowflake/PO_Cancelled_Qty/).
+  DELETE FLAGS - READ BEFORE RELYING ON THEM (measured in perf 2026-08-26)
+  ------------------------------------------------------------------------
+  There are TWO different flags and they are easy to confuse:
+
+  1. IsDelete (bit)  = the Synapse Link SINK TOMBSTONE. Present on
+     inventtransorigin, inventtrans, inventdim, purchline and purchtable.
+     >> It is NULL on 100% of rows - 45,773,729 inventtransorigin,
+        45,843,575 inventtrans, 3,430,680 inventdim, 268,704 purchline.
+        Zero rows are 1 and zero rows are even 0.
+     This feed is a CURRENT-STATE snapshot: when D365 deletes a row it is
+     physically removed from the base table, never tombstoned. The
+     *_partitioned views do not help either (inventtransorigin_partitioned
+     holds 28,568 rows, all IsDelete NULL).
+     => Confirming / cancelling a PO can NEVER flip this flag to "yes" here.
+        The rows simply STOP EXISTING. To observe the effect you must diff
+        ROW COUNTS before and after - see po_delete_flag_probe.sql.
+
+  >> CONFIRMING A CANCELLED PO DESTROYS THE QTY - IT DOES NOT FLAG IT.
+     Retention of InventTransOrigin/InventTrans on cancelled+zeroed PO lines,
+     by purchtable.documentstate (perf, 6,482 lines, 2026-08-26):
+         documentstate  0 Draft      21 lines -> 13 keep rows  (61.9%)
+         documentstate 10 In review  46 lines -> 32 keep rows  (69.6%)
+         documentstate 30 Approved   39 lines ->  0 keep rows  ( 0.0%)
+         documentstate 40 CONFIRMED 5909 lines -> 35 keep rows ( 0.6%)
+     The rows are DELETED at confirm, not tombstoned. There is no flag to read.
+     Worked case: PO 0000697060 was cancelled (purchstatus 4, qtyordered 0 on
+     all 4 lines) but left at documentstate 0 - its InventTrans rows still
+     held the original 10 units. Confirm it and they disappear.
+
+  2. isdeleted (bigint) = the D365 APPLICATION field. Exists ONLY on
+     purchline - inventtransorigin / inventtrans / inventdim do not have it.
+     It IS populated: 853 lines carry isdeleted = 1 (767 at purchstatus 1,
+     86 at purchstatus 4). Every one of them has qtyordered = 0, so it
+     flags the line as deleted but still yields no original quantity.
+     NOTE: this is the field the BI staging view mixes up with IsDelete.
+
 ==============================================================================*/
 
 SELECT  ito.referenceid                 AS purchid,
@@ -69,7 +105,16 @@ SELECT  ito.referenceid                 AS purchid,
         it.invoiceid,
         it.costamountposted,
         it.costamountphysical,
-        ito.recid                       AS origin_recid
+        ito.recid                       AS origin_recid,
+        -- delete / version flags (see DELETE FLAGS note in the header)
+        ito.IsDelete                    AS origin_isdelete,     -- sink tombstone: ALWAYS NULL
+        it.IsDelete                     AS trans_isdelete,      -- sink tombstone: ALWAYS NULL
+        idim.IsDelete                   AS dim_isdelete,        -- sink tombstone: ALWAYS NULL
+        ito.sysdatastatecode            AS origin_datastate,
+        it.sysdatastatecode             AS trans_datastate,
+        ito.SinkModifiedOn              AS origin_sinkmodified,
+        it.SinkModifiedOn               AS trans_sinkmodified,
+        it.recversion                   AS trans_recversion
 FROM        inventtransorigin ito
 INNER JOIN  inventtrans it
         ON  it.inventtransorigin = ito.recid
