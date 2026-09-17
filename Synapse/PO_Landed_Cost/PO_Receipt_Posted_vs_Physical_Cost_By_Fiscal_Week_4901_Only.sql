@@ -1,23 +1,19 @@
--- Fiscal-week total of PO receipt cost: costamountposted (pre-landed) vs costamountphysical (full landed)
--- Purpose: see, fiscal week by fiscal week, when/how the landed-cost gap opens up. Daily buckets
--- are too thin - a light-receipt day swings gap_pct wildly on a tiny base. Fiscal week matches the
--- grain the BI report itself uses.
+-- Fiscal-week total of PO receipt cost at 4901 RETAIL DC ONLY: costamountposted (pre-landed) vs
+-- costamountphysical (full landed).
 --
--- ANCHOR CORRECTED 2026-09-17: PacSun's FY 4-5-4 calendar (confirmed from the D365 Fiscal calendars
--- screen) has FY2026 starting 2026-02-01, a SUNDAY - weeks run Sun-Sat. The workbook's own "FW" date
--- column (e.g. Fiscal Week 22 -> 2026-07-04) is the WEEK-ENDING Saturday, not the start - using it
--- directly as a start anchor put every week boundary 6 days late. Verified: 2026-02-01 = Sunday,
--- 2026-06-28 = Sunday (true FW22 start), 2026-07-04 = Saturday (FW22's own end / the date the
--- workbook stores). With the corrected anchor, FW22 posted here ($10,094,570) lands within 0.1% of
--- the BI pivot's own 8.12 PROD FW22 figure ($10,087,684) - confirms the anchor, not scope, was most
--- of the earlier mismatch.
+-- Scoped to inventlocationid = '4901' per Tyler: PO's are basically exclusively received there.
+-- This excludes: wholesale/CHINO* sites, and '4112 - DROP SHIP' (a virtual location carrying
+-- ~10K thin cost-only rows at ~$20/row in a single fiscal week sample - not physical DC receipts).
 --
--- Residual note: costamountphysical still runs a bit high vs BI's 9.4 PROD figure in spot checks.
--- Candidate scope differences not yet ruled in/out: wholesale/CHINO* receiving sites and non-4901
--- receiving locations (e.g. store-direct receipts) may be outside what "Total Company Receipts at
--- Cost" scopes to - add an inventlocationid filter (join inventdim/inventlocation) if you want to
--- test that directly. statusreceipt does NOT cleanly separate this - virtually all rows in-scope
--- carry statusreceipt=1, so it's not the discriminator to filter on.
+-- Open question (2026-09-17): restricting to 4901-only gets cost_physical within ~0.3% of the BI
+-- pivot's own 9.4 PROD figure for FW22, but cost_posted comes in ~$311K SHORT of the BI 8.12 PROD
+-- figure for the same week - and that shortfall is almost exactly what sits in the excluded
+-- drop-ship + wholesale rows. Unclear whether BI's "posted" side scopes wider than "physical" (i.e.
+-- whether drop-ship cost postings are meant to count as "receipts") - unresolved, business call.
+--
+-- ANCHOR: PacSun FY 4-5-4 calendar, FY2026 starts 2026-02-01 (Sunday), weeks run Sun-Sat - confirmed
+-- against the D365 Fiscal calendars screen. The workbook's own "FW" column stores the week-ENDING
+-- Saturday, not the start.
 --
 -- Env: d365-synapse-ps-prod-ondemand.sql.azuresynapse.net / dataverse_psprod_unq1fedfd537528f111a7e5000d3a5cc
 -- Gotchas applied: ISNULL(IsDelete,0)=0 (Synapse Link tombstone), qty>0 (receipts only, not
@@ -39,10 +35,14 @@ FROM inventtrans it
 JOIN inventtransorigin o
     ON o.recid = it.inventtransorigin
    AND o.dataareaid = it.dataareaid
+LEFT JOIN inventdim id
+    ON id.inventdimid = it.inventdimid
+   AND id.dataareaid = it.dataareaid
 WHERE it.dataareaid = '1001'
   AND ISNULL(it.IsDelete, 0) = 0
   AND o.referencecategory = 3            -- Purchase Order
   AND it.qty > 0                         -- receipts only (excludes reversals/negative adjustments)
+  AND id.inventlocationid = '4901'       -- Retail DC only - excludes drop-ship (4112) and wholesale
   AND it.datephysical >= '2026-02-01'    -- Fiscal Week 1 start (FY2026, 4-5-4 calendar); guards the DATEDIFF anchor
 GROUP BY 1 + DATEDIFF(day, '2026-02-01', it.datephysical) / 7
 ORDER BY fiscal_week;
