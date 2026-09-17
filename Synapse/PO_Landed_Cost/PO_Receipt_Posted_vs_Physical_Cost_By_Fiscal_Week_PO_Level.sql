@@ -1,77 +1,60 @@
--- PO-LEVEL fiscal-week total of PO receipt cost: costamountposted vs costamountphysical.
+-- FINAL, VALIDATED: fiscal-week total of PO receipt cost, costamountposted vs costamountphysical.
+-- (Filename kept for history; this is now the per-TRANSACTION grain, not per-PO - see below.)
 --
--- STRUCTURAL FINDING #1 (2026-09-17, confirmed on 6 example POs then validated at full scale): the
--- BI "Total Company Receipts at Cost" report does NOT bucket each inventtrans row by its own
--- datephysical. It buckets each PURCHASE ORDER by the fiscal week of its FIRST physical receipt,
--- then attributes that PO's ENTIRE CUMULATIVE receipt cost (all waves, however many weeks it keeps
--- receiving) to that one week. E.g. PO 0000767163 received from 6/29/2026 through 9/8/2026 (fiscal
--- weeks 22-32) but BI books its full $236,622 entirely to Fiscal Week 22, because that's when its
--- FIRST unit arrived. Six example POs matched BI's own reported $ within $0.30-$555 (<0.1%) each.
+-- TWO WRONG TURNS CORRECTED ALONG THE WAY (2026-09-17) - kept here so the mistake isn't repeated:
 --
--- STRUCTURAL FINDING #2 (2026-09-17, corrects an initial mistake): costamountposted is legitimately
--- $0 on any receipt that has NOT YET been invoiced (purchstatus 1 Open or 2 Received, never reaches
--- 3 Invoiced) - confirmed on several stuck April-2026 (go-live week) POs still sitting un-invoiced
--- 5+ months later. Diffing that $0 against a fully-populated costamountphysical manufactures a huge
--- FAKE landed-cost gap that has nothing to do with the actual costing fix - e.g. fiscal week 9
--- showed an $890K fake gap this way (302 un-invoiced rows alone contributed $729,604 of it), when
--- BI's own report showed ~$0 variance for that whole era. Excluding costamountposted=0 rows from
--- the gap calculation collapses weeks 9-21 back down to near-zero (matching BI) and brings weeks
--- 22-27 into the right order of magnitude vs BI's own reported COST VAR (previously 10-20x too big,
--- now mostly within 2x, week 27 within 13%). The gap_invoiced_only column below is the one to trust;
--- gap_all (kept for reference) is inflated by un-invoiced noise and should NOT be used.
+-- 1. WRONG: "each PO's entire cumulative total belongs to the fiscal week of its FIRST receipt."
+--    This looked right on several hand-picked simple, single-wave POs (matched BI within $0.30-$555)
+--    but is FALSE in general. Proof: PO 0000767103, style 0133-60489-0094 color 1, appears in BI
+--    across THREE separate fiscal weeks by receiving wave - wk23: 9,953u/$123,206, wk24: 60u/$743,
+--    wk25: 240u/$2,971. A PO-cumulative query crams all 10,253 units into one week; BI does not.
+--    The correct grain is per-transaction datephysical, exactly like a naive first attempt - the
+--    PO-cumulative theory was an overcorrection that fixed a different bug (see #2) for the wrong
+--    reason.
 --
--- Residual note: fiscal weeks 22+ still run somewhat higher here than BI's frozen 9/4 snapshot -
--- expected, since this query reads LIVE data and landed-cost corrections have kept landing in the
--- ~2 weeks since BI's pull. Not a bug; a live-vs-point-in-time-snapshot difference.
+-- 2. RIGHT, and still needed: costamountposted is legitimately $0 on any receipt not yet invoiced
+--    (purchstatus 1/2, never reaches 3-Invoiced). Diffing that $0 against a populated
+--    costamountphysical manufactures a fake gap. Excluding costamountposted=0 rows from BOTH sums
+--    (not just from posted) is required - confirmed this alone took fiscal week 9's total from an
+--    $890K fake gap down to essentially flat, matching BI's own reported ~$0 variance for that era.
+--
+-- VALIDATED at full scale (per-transaction datephysical + 4901 + invoiced-only): 11 of 12 weeks
+-- checked land within 1-7% of BI's own reported total (posted side); fiscal week 27 (closest to
+-- BI's own report cutoff) runs ~17-19% short, most likely because more of that week's activity is
+-- still genuinely un-invoiced as of today than in older, fully-settled weeks - not chased further.
+-- Also validated exactly (to the dollar) on PO 0000767103's three-way wave split above.
 --
 -- Scoped to inventlocationid = '4901' (PO's are basically exclusively received there per Tyler;
 -- excludes drop-ship location 4112 and wholesale/CHINO* sites).
 --
--- ANCHOR: PacSun FY 4-5-4 calendar, FY2026 starts 2026-02-01 (Sunday), weeks run Sun-Sat.
+-- ANCHOR: PacSun FY 4-5-4 calendar, FY2026 starts 2026-02-01 (Sunday), weeks run Sun-Sat - confirmed
+-- against the D365 Fiscal calendars screen (the workbook's own "FW" column stores the week-ENDING
+-- Saturday, not the start - don't use it directly as an anchor).
+--
 -- Env: d365-synapse-ps-prod-ondemand.sql.azuresynapse.net / dataverse_psprod_unq1fedfd537528f111a7e5000d3a5cc
--- Gotchas applied: ISNULL(IsDelete,0)=0 (Synapse Link tombstone), qty>0 (receipts only),
--- referencecategory=3 (Purchase Order origin), excludes the 1900-01-01 sentinel date on
--- placeholder rows when finding each PO's first real receipt date.
+-- Gotchas applied: ISNULL(IsDelete,0)=0 (Synapse Link tombstone), qty>0 (receipts only, not
+-- reversals), referencecategory=3 (Purchase Order origin).
 
-WITH po_first AS (
-    -- each PO's first TRUE physical receipt date (excludes the 1900 sentinel on placeholder rows)
-    SELECT o.referenceid AS purchid, MIN(it.datephysical) AS first_receipt_date
-    FROM inventtrans it
-    JOIN inventtransorigin o ON o.recid = it.inventtransorigin AND o.dataareaid = it.dataareaid
-    WHERE it.dataareaid = '1001' AND ISNULL(it.IsDelete,0) = 0
-      AND o.referencecategory = 3 AND it.qty > 0
-      AND it.datephysical > '1901-01-01'
-    GROUP BY o.referenceid
-),
-po_totals AS (
-    -- each PO's CUMULATIVE receipt cost across its entire history, 4901 only, split so the gap
-    -- calc can exclude not-yet-invoiced (costamountposted = 0) rows
-    SELECT o.referenceid AS purchid,
-           SUM(it.costamountposted)   AS posted_all,
-           SUM(it.costamountphysical) AS physical_all,
-           SUM(CASE WHEN it.costamountposted <> 0 THEN it.costamountposted   ELSE 0 END) AS posted_invoiced_only,
-           SUM(CASE WHEN it.costamountposted <> 0 THEN it.costamountphysical ELSE 0 END) AS physical_invoiced_only,
-           SUM(it.qty) AS units
-    FROM inventtrans it
-    JOIN inventtransorigin o ON o.recid = it.inventtransorigin AND o.dataareaid = it.dataareaid
-    LEFT JOIN inventdim id ON id.inventdimid = it.inventdimid AND id.dataareaid = it.dataareaid
-    WHERE it.dataareaid = '1001' AND ISNULL(it.IsDelete,0) = 0
-      AND o.referencecategory = 3 AND it.qty > 0
-      AND id.inventlocationid = '4901'
-    GROUP BY o.referenceid
-)
 SELECT
-    1 + DATEDIFF(day, '2026-02-01', f.first_receipt_date) / 7   AS fiscal_week,
-    MIN(f.first_receipt_date)                                  AS week_start,
-    COUNT(*)                                                   AS n_pos,
-    SUM(t.units)                                               AS units,
-    SUM(t.posted_all)                                          AS cost_posted_all,      -- includes un-invoiced $0 noise
-    SUM(t.physical_all)                                        AS cost_physical_all,    -- includes un-invoiced $0 noise
-    SUM(t.posted_invoiced_only)                                AS cost_posted,          -- BI's old "Receipts $ @Cost" proxy
-    SUM(t.physical_invoiced_only)                               AS cost_physical,       -- BI's new "Receipts $ @Cost" proxy
-    SUM(t.physical_invoiced_only) - SUM(t.posted_invoiced_only) AS gap_invoiced_only     -- TRUST THIS ONE
-FROM po_first f
-JOIN po_totals t ON t.purchid = f.purchid
-WHERE f.first_receipt_date >= '2026-02-01'
-GROUP BY 1 + DATEDIFF(day, '2026-02-01', f.first_receipt_date) / 7
+    1 + DATEDIFF(day, '2026-02-01', it.datephysical) / 7   AS fiscal_week,
+    MIN(it.datephysical)                                   AS week_start,
+    COUNT(*)                                                AS n_rows,
+    SUM(it.qty)                                             AS units,
+    SUM(CASE WHEN it.costamountposted <> 0 THEN it.costamountposted   ELSE 0 END) AS cost_posted,    -- excludes not-yet-invoiced rows; BI's old "Receipts $ @Cost" proxy
+    SUM(CASE WHEN it.costamountposted <> 0 THEN it.costamountphysical ELSE 0 END) AS cost_physical,  -- excludes not-yet-invoiced rows; BI's new "Receipts $ @Cost" proxy
+    SUM(CASE WHEN it.costamountposted <> 0 THEN it.costamountphysical - it.costamountposted ELSE 0 END) AS gap
+FROM inventtrans it
+JOIN inventtransorigin o
+    ON o.recid = it.inventtransorigin
+   AND o.dataareaid = it.dataareaid
+LEFT JOIN inventdim id
+    ON id.inventdimid = it.inventdimid
+   AND id.dataareaid = it.dataareaid
+WHERE it.dataareaid = '1001'
+  AND ISNULL(it.IsDelete, 0) = 0
+  AND o.referencecategory = 3            -- Purchase Order
+  AND it.qty > 0                         -- receipts only (excludes reversals/negative adjustments)
+  AND id.inventlocationid = '4901'       -- Retail DC only - excludes drop-ship (4112) and wholesale
+  AND it.datephysical >= '2026-02-01'    -- Fiscal Week 1 start (FY2026, 4-5-4 calendar); guards the DATEDIFF anchor
+GROUP BY 1 + DATEDIFF(day, '2026-02-01', it.datephysical) / 7
 ORDER BY fiscal_week;
