@@ -20,7 +20,14 @@
      dlvterm = 'FOB'  -- PacSun pays duty + freight, so landing factors apply.
                          DDP / DDP_VW / DDP_CA are vendor-paid (0 duty by
                          design; only 49 of 6,725 carry a port) and are NOT a gap.
-     purchstatus = 1  -- still an open order, i.e. still fixable before receipt.
+     purchstatus = 1  -- Backorder, read off the LINE, not the header.
+                         Corrected 2026-09-21. pacApplyLandFactorEstimatesService
+                         filters `purchLine.PurchStatus == PurchStatus::Backorder`,
+                         so a line that is already received, invoiced or cancelled
+                         will never be priced again no matter what is fixed on it.
+                         Scoping on purchtable.purchstatus swept in 7,547 such
+                         lines / $20.6M across the open population -- rows the PO
+                         team cannot action.
      dataareaid  = '1001'
 
    Filters: purchtable  ISNULL(IsDelete,0)=0                 (CDC tombstone)
@@ -68,10 +75,9 @@ WITH l AS (
     WHERE ISNULL(h.IsDelete,0) = 0
       AND ISNULL(pl.IsDelete,0) = 0
       AND pl.isdeleted = 0
-      AND h.purchstatus = 1
+      AND pl.purchstatus = 1          -- Backorder, read off the LINE (see note below)
       AND h.dataareaid = '1001'
       AND h.dlvterm COLLATE DATABASE_DEFAULT = 'FOB'
-      AND ISNULL(pl.purchstatus,1) <> 4
 ), p AS (
     SELECT
         purchid, dataareaid, orderaccount, purchname, deliverydate, created_by,
