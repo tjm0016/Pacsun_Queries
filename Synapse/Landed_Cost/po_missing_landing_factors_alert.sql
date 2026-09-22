@@ -78,6 +78,19 @@ WITH l AS (
       AND pl.purchstatus = 1          -- Backorder, read off the LINE (see note below)
       AND h.dataareaid = '1001'
       AND h.dlvterm COLLATE DATABASE_DEFAULT = 'FOB'
+      /* Drop the ENTIRE PO if ANY line has been received or invoiced -- Tyler
+         2026-09-21: "if any line is received or invoiced it should not be on the
+         report". A partially received PO is past the point where correcting the
+         landing factors is worth doing, even on its still-open lines. */
+      AND NOT EXISTS (
+            SELECT 1
+            FROM dbo.purchline x
+            WHERE x.purchid    COLLATE DATABASE_DEFAULT = pl.purchid    COLLATE DATABASE_DEFAULT
+              AND x.dataareaid COLLATE DATABASE_DEFAULT = pl.dataareaid COLLATE DATABASE_DEFAULT
+              AND ISNULL(x.IsDelete,0) = 0
+              AND x.isdeleted = 0
+              AND x.purchstatus IN (2, 3)   -- 2 Received, 3 Invoiced
+          )
 ), p AS (
     SELECT
         purchid, dataareaid, orderaccount, purchname, deliverydate, created_by,

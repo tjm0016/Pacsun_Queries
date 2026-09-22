@@ -57,6 +57,17 @@ WITH l AS (
       AND pl.purchstatus = 1
       AND pl.dlvterm COLLATE DATABASE_DEFAULT = 'FOB'
       AND DATEDIFF(day, pl.createddatetime, GETUTCDATE()) >= 2   -- manual-button grace
+      /* Drop the ENTIRE PO if ANY line has been received or invoiced -- Tyler
+         2026-09-21. Partially received POs are off the report completely. */
+      AND NOT EXISTS (
+            SELECT 1
+            FROM dbo.purchline x
+            WHERE x.purchid    COLLATE DATABASE_DEFAULT = pl.purchid    COLLATE DATABASE_DEFAULT
+              AND x.dataareaid COLLATE DATABASE_DEFAULT = pl.dataareaid COLLATE DATABASE_DEFAULT
+              AND ISNULL(x.IsDelete,0) = 0
+              AND x.isdeleted = 0
+              AND x.purchstatus IN (2, 3)   -- 2 Received, 3 Invoiced
+          )
 ), nofrt AS (
     SELECT l.*,
            CASE WHEN EXISTS (
