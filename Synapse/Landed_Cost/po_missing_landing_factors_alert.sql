@@ -143,8 +143,9 @@ SELECT
     p.hdr_term                                                  AS Delivery_Terms,
     CAST(p.units AS int)                                        AS Units_Ordered,
     CAST(p.line_amount AS decimal(18,2))                        AS Line_Amount,
-    CASE WHEN p.deliverydate >= CAST(GETUTCDATE() AS date)
-         THEN 'Upcoming' ELSE 'Past due' END                    AS Delivery_Status,
+    /* No status column: every row here is purchstatus 1 = Open order, so it
+       would be constant. Urgency is carried by Days_To_Delivery (negative =
+       past due) and by the sort order below. */
     CONVERT(varchar(10), p.deliverydate, 101)                   AS Delivery_Date,
     DATEDIFF(day, CAST(GETUTCDATE() AS date), p.deliverydate)   AS Days_To_Delivery,
     p.created_by                                                AS Created_By,
