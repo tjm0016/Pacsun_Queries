@@ -41,7 +41,15 @@ WITH l AS (
         ISNULL(pl.qtyordered,0)         AS qtyordered,
         ISNULL(pl.lineamount,0)         AS lineamount,
         pl.createddatetime,
-        h.orderaccount, h.purchname, h.deliverydate, ISNULL(h.createdby,'') AS created_by
+        h.orderaccount, h.purchname, h.deliverydate, ISNULL(h.createdby,'') AS created_by,
+        /* MAF = Majid Al Futtaim Lifestyle LLC, customer 163. Tyler 2026-10-01: MAF POs
+           go to their own attachment. Older (June) MAF POs carry 163 only on
+           tradeendcustomeraccount; newer ones on both fields, so test either. */
+        CASE WHEN '163' IN (ISNULL(h.tradeendcustomeraccount,'') COLLATE DATABASE_DEFAULT,
+                            ISNULL(h.pacrelatedcustomer,'')      COLLATE DATABASE_DEFAULT)
+             THEN '163'
+             ELSE COALESCE(NULLIF(h.tradeendcustomeraccount,''), NULLIF(h.pacrelatedcustomer,''), '')
+        END                                             AS end_customer
     FROM dbo.purchline pl
     JOIN dbo.inventtable it
       ON it.itemid     COLLATE DATABASE_DEFAULT = pl.itemid     COLLATE DATABASE_DEFAULT
@@ -116,13 +124,14 @@ SELECT
     CONVERT(varchar(10), MIN(c.deliverydate), 101)              AS Delivery_Date,
     DATEDIFF(day, CAST(GETUTCDATE() AS date), MIN(c.deliverydate)) AS Days_To_Delivery,
     c.created_by                                                AS Buyer,
-    c.dataareaid                                                AS Company
+    c.dataareaid                                                AS Company,
+    NULLIF(c.end_customer,'')                                   AS End_Customer  -- '163' = MAF, split off in the Logic App
 FROM coded c
 LEFT JOIN dbo.vendtable vt
        ON vt.accountnum COLLATE DATABASE_DEFAULT = c.orderaccount COLLATE DATABASE_DEFAULT
       AND vt.dataareaid COLLATE DATABASE_DEFAULT = c.dataareaid   COLLATE DATABASE_DEFAULT
       AND ISNULL(vt.IsDelete,0) = 0
 LEFT JOIN dbo.dirpartytable dp ON dp.recid = vt.party
-GROUP BY c.purchid, c.orderaccount, c.purchname, c.created_by, c.dataareaid, dp.name
+GROUP BY c.purchid, c.orderaccount, c.purchname, c.created_by, c.dataareaid, dp.name, c.end_customer
 /* biggest dollars first - this list is worked top-down, not chronologically */
 ORDER BY SUM(c.lineamount) DESC, c.purchid;

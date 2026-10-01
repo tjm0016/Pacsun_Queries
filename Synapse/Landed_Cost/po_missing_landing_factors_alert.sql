@@ -57,6 +57,14 @@ WITH l AS (
         h.purchname,
         h.deliverydate,
         ISNULL(h.createdby,'')                          AS created_by,
+        /* MAF = Majid Al Futtaim Lifestyle LLC, customer 163. Tyler 2026-10-01: MAF POs
+           go to their own attachment. Older (June) MAF POs carry 163 only on
+           tradeendcustomeraccount; newer ones on both fields, so test either. */
+        CASE WHEN '163' IN (ISNULL(h.tradeendcustomeraccount,'') COLLATE DATABASE_DEFAULT,
+                            ISNULL(h.pacrelatedcustomer,'')      COLLATE DATABASE_DEFAULT)
+             THEN '163'
+             ELSE COALESCE(NULLIF(h.tradeendcustomeraccount,''), NULLIF(h.pacrelatedcustomer,''), '')
+        END                                             AS end_customer,
         h.createddatetime,
         ISNULL(h.itmfromport,'')                        AS hdr_port,
         ISNULL(h.dlvmode,'')                            AS hdr_mode,
@@ -93,7 +101,7 @@ WITH l AS (
           )
 ), p AS (
     SELECT
-        purchid, dataareaid, orderaccount, purchname, deliverydate, created_by,
+        purchid, dataareaid, orderaccount, purchname, deliverydate, created_by, end_customer,
         MIN(createddatetime)                                            AS createddatetime,
         MAX(hdr_port)                                                   AS hdr_port,
         MAX(hdr_mode)                                                   AS hdr_mode,
@@ -114,7 +122,7 @@ WITH l AS (
         SUM(qtyordered)                                                 AS units,
         SUM(line_amount)                                                AS line_amount
     FROM l
-    GROUP BY purchid, dataareaid, orderaccount, purchname, deliverydate, created_by
+    GROUP BY purchid, dataareaid, orderaccount, purchname, deliverydate, created_by, end_customer
 )
 SELECT
     p.purchid                                                   AS PO,
@@ -153,7 +161,8 @@ SELECT
         CAST(p.createddatetime AT TIME ZONE 'UTC'
                                AT TIME ZONE 'Pacific Standard Time' AS date), 101)
                                                                 AS Created_Date,
-    p.dataareaid                                                AS Company
+    p.dataareaid                                                AS Company,
+    NULLIF(p.end_customer,'')                                   AS End_Customer  -- '163' = MAF, split off in the Logic App
 FROM p
 LEFT JOIN dbo.vendtable     vt ON vt.accountnum COLLATE DATABASE_DEFAULT = p.orderaccount COLLATE DATABASE_DEFAULT
                               AND vt.dataareaid COLLATE DATABASE_DEFAULT = p.dataareaid   COLLATE DATABASE_DEFAULT
