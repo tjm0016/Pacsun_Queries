@@ -2,7 +2,8 @@
 -- Reproduces the "D365 OH" by-date export for -T warehouses to the unit (validated 2026-10-05
 -- against 'D365 OH 08.15-08.22.xlsx': all 8 days, all 325 -T warehouses, diff = 0).
 -- Date basis = inventtrans.datephysical = the POSTING date of the CTN-TRANSFER journal, NOT the
--- carton's ship/scan time. Receive legs post after midnight PT on weekdays -> dated the next day.
+-- carton's ship/scan time. Through 8/31/2026 (one MAO receipt file a day) weekday receive legs posted after
+-- midnight PT and carry the next day's date; since 9/2 (MAO files ~5x/day) they post the same day.
 -- Synapse serverless prod, base tables. Company 1001.
 DECLARE @asof date = '2026-08-22';
 

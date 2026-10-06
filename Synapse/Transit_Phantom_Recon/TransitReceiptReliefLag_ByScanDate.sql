@@ -1,7 +1,7 @@
 -- Store carton receipts by store scan date (PT) vs. the date InventTrans relieves the -T warehouse.
--- Weekdays: ~85-93% of receipt units leave -T the NEXT day (Carton Receive batch starts ~11:21 PM PT;
--- journals posted after midnight carry the next date). Weekends: all same day. Validated 2026-10-05 for
--- 8/14-8/22/2026 (e.g. Mon 8/17: 12,361 same day / 172,763 next day). Pairs with TransitReceiveJournalLag.sql.
+-- Through 8/31/2026 MAO sent ONE receipt file a day (landing ~11:15 PM PT): receive journals posted overnight and
+-- 76-95% of weekday receipt units were relieved the NEXT day. Since 9/2/2026 MAO sends 4-6 files a day (landing
+-- ~07:45/11:45/15:45/19:45/22:45 PT): ~0% next day. Validated 2026-10-06 for 8/10-10/5. Pairs with TransitReceiveJournalLag.sql.
 DECLARE @from date = '2026-08-14', @to date = '2026-08-22';
 WITH rcv AS (
   SELECT h.cartonnumber COLLATE DATABASE_DEFAULT AS cartonnumber,
