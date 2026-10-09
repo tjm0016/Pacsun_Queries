@@ -1,7 +1,7 @@
 -- Confirmed PO Lines For Zero Cost Items
 -- Lines on CONFIRMED POs (purchtable.documentstate = 40) for items whose item-master cost price = $0.
--- Excludes canceled lines (purchstatus 4) and soft-deleted lines (isdeleted = 1).
--- Source: D365 Synapse (dataverse_psprod). 7,319 lines / 6,035 POs / 381 items on 2026-10-09.
+-- Excludes canceled lines (purchstatus 4) and soft-deleted lines (isdeleted = 1). POType flags return orders.
+-- Source: D365 Synapse (dataverse_psprod). 7,319 lines / 6,035 POs / 381 items on 2026-10-09 (18 lines on 1 return order).
 
 WITH zero_cost AS (
     SELECT m.itemid, m.price AS ItemCostPrice
@@ -15,6 +15,8 @@ SELECT
     pt.purchid                                  AS PurchId,
     CASE pt.purchstatus WHEN 1 THEN 'Open order' WHEN 2 THEN 'Received' WHEN 3 THEN 'Invoiced'
                         WHEN 4 THEN 'Canceled' ELSE CAST(pt.purchstatus AS VARCHAR(10)) END AS POStatus,
+    CASE pt.purchasetype WHEN 3 THEN 'Purchase order' WHEN 4 THEN 'Returned order'
+                         WHEN 0 THEN 'Journal' ELSE CAST(pt.purchasetype AS VARCHAR(10)) END AS POType,
     'Confirmed'                                 AS ApprovalStatus,
     pt.orderaccount                             AS VendorAccount,
     vp.name                                     AS VendorName,

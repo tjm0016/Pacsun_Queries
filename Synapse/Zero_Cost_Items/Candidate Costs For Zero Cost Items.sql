@@ -22,6 +22,7 @@ po AS (   -- one row per item per confirmed PO, same math as ISS-01529
          AND ISNULL(pl.IsDelete, 0) = 0 AND pl.isdeleted = 0 AND pl.purchstatus <> 4
     WHERE pt.dataareaid = '1001' AND ISNULL(pt.IsDelete, 0) = 0
       AND pt.documentstate = 40          -- Confirmed
+      AND pt.purchasetype = 3            -- Purchase order (excludes 4 = Returned order)
       AND pl.itemid IN (SELECT itemid FROM zero_cost)
     GROUP BY pl.itemid, pt.purchid, pt.itembuyergroupid, pt.createddatetime
     HAVING SUM(pl.purchqty) > 0
@@ -31,22 +32,25 @@ po_ranked AS (
            ROW_NUMBER() OVER (PARTITION BY itemid ORDER BY createddatetime DESC, purchid DESC) AS rn_latest,
            ROW_NUMBER() OVER (PARTITION BY itemid ORDER BY CASE WHEN landed_total > 0 THEN 0 ELSE 1 END,
                                                            createddatetime DESC, purchid DESC) AS rn_landed,
-           COUNT(*)          OVER (PARTITION BY itemid) AS po_count,
-           SUM(qty)          OVER (PARTITION BY itemid) AS all_qty,
-           SUM(landed_total) OVER (PARTITION BY itemid) AS all_landed
+           COUNT(*)          OVER (PARTITION BY itemid) AS po_count
     FROM po
 ),
 po_item AS (
     SELECT itemid,
            MAX(po_count)                                                                 AS ConfirmedPOs,
+           SUM(qty)                                                                      AS ConfirmedPOQty,
+           SUM(line_amount) / SUM(qty)                                                   AS ConfirmedPOAvgUnitCost,
+           MIN(line_amount / qty)                                                        AS ConfirmedPOMinUnitCost,
+           MAX(line_amount / qty)                                                        AS ConfirmedPOMaxUnitCost,
+           SUM(CASE WHEN landed_total > 0 THEN landed_total END)
+             / NULLIF(SUM(CASE WHEN landed_total > 0 THEN qty END), 0)                   AS ConfirmedPOAvgLandedCost,
            MAX(CASE WHEN rn_latest = 1 THEN purchid END)                                 AS LatestPO,
            MAX(CASE WHEN rn_latest = 1 THEN createddatetime END)                         AS LatestPOCreatedUTC,
            MAX(CASE WHEN rn_latest = 1 THEN itembuyergroupid END)                        AS LatestPOBuyerGroup,
            MAX(CASE WHEN rn_latest = 1 THEN landed_total / qty END)                      AS LatestPOLandedCost,
            MAX(CASE WHEN rn_latest = 1 THEN line_amount / qty END)                       AS LatestPOUnitPrice,
            MAX(CASE WHEN rn_landed = 1 AND landed_total > 0 THEN purchid END)            AS LatestLandedPO,
-           MAX(CASE WHEN rn_landed = 1 AND landed_total > 0 THEN landed_total / qty END) AS LatestLandedPOCost,
-           MAX(CASE WHEN all_qty > 0 THEN all_landed / all_qty END)                      AS AllPOsAvgLandedCost
+           MAX(CASE WHEN rn_landed = 1 AND landed_total > 0 THEN landed_total / qty END) AS LatestLandedPOCost
     FROM po_ranked
     GROUP BY itemid
 ),
@@ -111,14 +115,18 @@ SELECT
         ELSE 'Latest PO has landed cost but item cost still $0'
     END                                         AS LikelyReason,
     i.ConfirmedPOs,
+    i.ConfirmedPOQty,
+    i.ConfirmedPOAvgUnitCost,
+    i.ConfirmedPOAvgLandedCost,
+    i.ConfirmedPOMinUnitCost,
+    i.ConfirmedPOMaxUnitCost,
     i.LatestPO,
     CAST(i.LatestPOCreatedUTC AT TIME ZONE 'UTC' AT TIME ZONE 'Pacific Standard Time' AS DATE) AS LatestPOCreatedPST,
     i.LatestPOBuyerGroup,
+    i.LatestPOUnitPrice                         AS LatestPOUnitCost,
     i.LatestPOLandedCost,
-    i.LatestPOUnitPrice,
     i.LatestLandedPO,
     i.LatestLandedPOCost,
-    i.AllPOsAvgLandedCost,
     i.MAC4901,
     i.Qty4901                                   AS OnHand4901,
     i.MACChain,
