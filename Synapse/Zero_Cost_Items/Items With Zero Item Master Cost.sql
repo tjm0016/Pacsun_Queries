@@ -1,6 +1,6 @@
 -- Items With Zero Item Master Cost
 -- Released products whose item-master cost price (InventTableModule ModuleType 0 .Price) = $0.
--- Source: D365 Synapse (dataverse_psprod). 868 items on 2026-10-09.
+-- Source: D365 Synapse (dataverse_psprod). 873 items on 2026-10-09 (868 earlier the same day).
 
 SELECT
     it.itemid                                   AS ItemId,
