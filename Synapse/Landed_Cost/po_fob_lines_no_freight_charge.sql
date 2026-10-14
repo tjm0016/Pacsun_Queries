@@ -67,6 +67,19 @@ WITH l AS (
       /* Confirmed POs only -- Tyler 2026-10-12. documentstate 40 = Confirmed;
          Draft / In review / Approved change requests are excluded. */
       AND h.documentstate = 40
+      /* SUPPRESSED -- Tyler 2026-10-14: every PO on the 10/14 email was reviewed and
+         cannot be fixed, so they are permanently off the report. Delete a PO from
+         this list to bring it back. */
+      AND pl.purchid COLLATE DATABASE_DEFAULT NOT IN (
+            '0000762414', '0000762416', '0000762419', '0000762425', '0000762427', '0000762429',
+            '0000762433', '0000762439', '0000762440', '0000762444', '0000763291', '0000763508',
+            '0000764754', '0000764765', '0000766265', '0000887810', '0001294496', '0001294498',
+            '0001294499', '0001350213', '0001350214', '0001350219', '0001350220', '0001350307',
+            '0001350451', '0001374576', '0001390458', '0001390459', '0001390460', '0001390461',
+            '0001390462', '0001390463', '0001411468', '0001411473', '0001411478', '0001525535',
+            '0001587715', '0001587716', '0001587717', '0001592013', '0001602191', '0001603583',
+            '0001603584', '2000007201'
+          )
       AND DATEDIFF(day, pl.createddatetime, GETUTCDATE()) >= 2   -- manual-button grace
       /* Drop the ENTIRE PO if ANY line has been received or invoiced -- Tyler
          2026-09-21. Partially received POs are off the report completely. */
