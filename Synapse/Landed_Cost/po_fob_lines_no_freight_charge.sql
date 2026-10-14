@@ -22,11 +22,11 @@
      PORT+MODE BLANK   28 lines /   9 POs /     $4,416.72
      PORT BLANK       503 lines / 110 POs /   $101,787.41
      MODE BLANK        38 lines /  15 POs /   $101,186.07
-     NO RATE FOR LANE  93 lines /  24 POs /    $20,884.21   <- guidance gap
+     NO RATE FOR LINE  93 lines /  24 POs /    $20,884.21   <- guidance gap
      ESTIMATE NOT RUN 547 lines / 130 POs / $1,436,775.57   <- the real money
    Total 1,209 lines / 288 POs / $1,665,049.98.
 
-   "NO RATE FOR LANE" emulates findSpecificCharges: a NULL guidance value is a
+   "NO RATE FOR LINE" emulates findSpecificCharges: a NULL guidance value is a
    wildcard, so the EXISTS below accepts NULL on itemclass / fromport / dlvmode /
    dlvterm. Note wildcards in this table are NULL, never '' -- testing = '' finds
    nothing and every wildcard row silently vanishes.
@@ -64,6 +64,9 @@ WITH l AS (
       AND pl.dataareaid COLLATE DATABASE_DEFAULT = '1001'
       AND pl.purchstatus = 1
       AND pl.dlvterm COLLATE DATABASE_DEFAULT = 'FOB'
+      /* Confirmed POs only -- Tyler 2026-10-12. documentstate 40 = Confirmed;
+         Draft / In review / Approved change requests are excluded. */
+      AND h.documentstate = 40
       AND DATEDIFF(day, pl.createddatetime, GETUTCDATE()) >= 2   -- manual-button grace
       /* Drop the ENTIRE PO if ANY line has been received or invoiced -- Tyler
          2026-09-21. Partially received POs are off the report completely. */
@@ -74,7 +77,20 @@ WITH l AS (
               AND x.dataareaid COLLATE DATABASE_DEFAULT = pl.dataareaid COLLATE DATABASE_DEFAULT
               AND ISNULL(x.IsDelete,0) = 0
               AND x.isdeleted = 0
-              AND x.purchstatus IN (2, 3)   -- 2 Received, 3 Invoiced
+              AND (    x.purchstatus IN (2, 3)   -- 2 Received, 3 Invoiced
+                    /* 2026-10-14: a PARTIALLY received line stays purchstatus 1
+                       (Open order), so status alone missed 3 of 44 POs. Any qty
+                       already off the open remainder means something arrived. */
+                    OR ISNULL(x.remainpurchphysical,0) < ISNULL(x.purchqty,0))
+          )
+      AND NOT EXISTS (   -- belt-and-braces: any received/purchased inventtrans on the PO
+            SELECT 1
+            FROM dbo.inventtransorigin o
+            JOIN dbo.inventtrans t ON t.inventtransorigin = o.recid AND ISNULL(t.IsDelete,0) = 0
+            WHERE o.referenceid COLLATE DATABASE_DEFAULT = pl.purchid    COLLATE DATABASE_DEFAULT
+              AND o.dataareaid  COLLATE DATABASE_DEFAULT = pl.dataareaid COLLATE DATABASE_DEFAULT
+              AND o.referencecategory = 3          -- Purchase order
+              AND t.statusreceipt IN (1, 2)        -- 1 Purchased (invoiced), 2 Received
           )
 ), nofrt AS (
     SELECT l.*,
@@ -93,14 +109,17 @@ WITH l AS (
         SELECT 1 FROM dbo.markuptrans m
         WHERE ISNULL(m.IsDelete,0) = 0
           AND m.transrecid = l.recid
-          AND m.markupcode COLLATE DATABASE_DEFAULT IN ('OCEAN_FRT','AIR_FRT'))
+          /* FREIGHT_ABS = go-live conversion freight code (10,755 rows, all loaded
+             2026-04-04 07:23-08:25). Converted POs carry freight ONLY under it, so
+             without it 766265 / 763291 etc. reported daily despite freight applied. */
+          AND m.markupcode COLLATE DATABASE_DEFAULT IN ('OCEAN_FRT','AIR_FRT','FREIGHT_ABS'))
 ), coded AS (
     SELECT *,
         CASE WHEN line_port = '' AND line_mode = '' THEN 'PORT+MODE BLANK'
              WHEN line_port = ''                    THEN 'PORT BLANK'
              WHEN line_mode = ''                    THEN 'MODE BLANK'
              WHEN item_class = ''                   THEN 'ITEM HAS NO CLASS'
-             WHEN lane_has_rate = 0                 THEN 'NO RATE FOR LANE'
+             WHEN lane_has_rate = 0                 THEN 'NO RATE FOR LINE'
              ELSE 'ESTIMATE NOT RUN' END AS reason
     FROM nofrt
 )
@@ -113,7 +132,7 @@ SELECT
         CASE WHEN SUM(CASE WHEN c.reason='PORT BLANK'        THEN 1 ELSE 0 END)>0 THEN ', PORT BLANK'        ELSE '' END +
         CASE WHEN SUM(CASE WHEN c.reason='MODE BLANK'        THEN 1 ELSE 0 END)>0 THEN ', MODE BLANK'        ELSE '' END +
         CASE WHEN SUM(CASE WHEN c.reason='ITEM HAS NO CLASS' THEN 1 ELSE 0 END)>0 THEN ', ITEM HAS NO CLASS' ELSE '' END +
-        CASE WHEN SUM(CASE WHEN c.reason='NO RATE FOR LANE'  THEN 1 ELSE 0 END)>0 THEN ', NO RATE FOR LANE'  ELSE '' END +
+        CASE WHEN SUM(CASE WHEN c.reason='NO RATE FOR LINE'  THEN 1 ELSE 0 END)>0 THEN ', NO RATE FOR LINE'  ELSE '' END +
         CASE WHEN SUM(CASE WHEN c.reason='ESTIMATE NOT RUN'  THEN 1 ELSE 0 END)>0 THEN ', ESTIMATE NOT RUN'  ELSE '' END,
         1, 2, '')                                               AS Reason,
     COUNT(*)                                                    AS Lines_No_Freight,

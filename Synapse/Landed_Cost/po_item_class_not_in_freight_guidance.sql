@@ -95,7 +95,20 @@ WITH health AS (
               AND x.dataareaid COLLATE DATABASE_DEFAULT = pl.dataareaid COLLATE DATABASE_DEFAULT
               AND ISNULL(x.IsDelete,0) = 0
               AND x.isdeleted = 0
-              AND x.purchstatus IN (2, 3)   -- 2 Received, 3 Invoiced
+              AND (    x.purchstatus IN (2, 3)   -- 2 Received, 3 Invoiced
+                    /* 2026-10-14: a PARTIALLY received line stays purchstatus 1
+                       (Open order), so status alone missed 3 of 44 POs. Any qty
+                       already off the open remainder means something arrived. */
+                    OR ISNULL(x.remainpurchphysical,0) < ISNULL(x.purchqty,0))
+          )
+      AND NOT EXISTS (   -- belt-and-braces: any received/purchased inventtrans on the PO
+            SELECT 1
+            FROM dbo.inventtransorigin o
+            JOIN dbo.inventtrans t ON t.inventtransorigin = o.recid AND ISNULL(t.IsDelete,0) = 0
+            WHERE o.referenceid COLLATE DATABASE_DEFAULT = pl.purchid    COLLATE DATABASE_DEFAULT
+              AND o.dataareaid  COLLATE DATABASE_DEFAULT = pl.dataareaid COLLATE DATABASE_DEFAULT
+              AND o.referencecategory = 3          -- Purchase order
+              AND t.statusreceipt IN (1, 2)        -- 1 Purchased (invoiced), 2 Received
           )
       AND ISNULL(it.suntafclassvalue,'') <> ''  -- blank class is a different problem
       AND NOT EXISTS (
