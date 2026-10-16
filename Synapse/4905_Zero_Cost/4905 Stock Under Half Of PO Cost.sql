@@ -73,12 +73,12 @@ priced AS (
 SELECT ItemId AS ItemNumber, ColorId AS Color, SizeId AS Size,
        OnHandQty,
        ROUND(OnHandValue, 2)                                  AS OnHandValue,
-       ROUND(OnHandValue / OnHandQty, 4)                      AS UnitCost4905,
+       ROUND(OnHandValue / NULLIF(OnHandQty, 0), 4)                      AS UnitCost4905,
        ROUND(POUnitCost, 4)                                   AS POUnitCost,
-       ROUND(100.0 * (OnHandValue / OnHandQty) / POUnitCost, 1) AS PctOfPOCost,
+       ROUND(100.0 * (OnHandValue / NULLIF(OnHandQty, 0)) / POUnitCost, 1) AS PctOfPOCost,
        ROUND(OnHandQty * POUnitCost - OnHandValue, 2)        AS ValueGap,
        CostSource, SourcePO,
        CAST(SourcePOCreated AT TIME ZONE 'UTC' AT TIME ZONE 'Pacific Standard Time' AS date) AS SourcePOCreatedPST
 FROM priced
-WHERE OnHandValue / OnHandQty <= @Ratio * POUnitCost
+WHERE OnHandValue / NULLIF(OnHandQty, 0) <= @Ratio * POUnitCost
 ORDER BY ValueGap DESC;

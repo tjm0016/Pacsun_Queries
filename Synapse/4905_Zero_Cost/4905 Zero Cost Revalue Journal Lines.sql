@@ -76,7 +76,7 @@ target AS (               -- under-costed pools with their new cost
     LEFT JOIN item_landed il ON il.ItemId = p.ItemId AND il.rn = 1
     LEFT JOIN var_fob     vf ON vf.ItemId = p.ItemId AND vf.ColorId = p.ColorId AND vf.SizeId = p.SizeId AND vf.rn = 1
     WHERE COALESCE(vl.Cost, il.Cost, vf.Cost) > 0
-      AND (p.PoolValue <= 0 OR p.PoolValue / p.PoolQty < @MaxUnitCost)
+      AND (p.PoolValue <= 0 OR p.PoolValue / NULLIF(p.PoolQty, 0) < @MaxUnitCost)
 ),
 loc AS (                  -- available units per 4905 location inside each target pool
     SELECT s.itemid COLLATE DATABASE_DEFAULT AS ItemId,
@@ -99,7 +99,7 @@ lines AS (
     SELECT ROW_NUMBER() OVER (ORDER BY t.ItemId, t.ColorId, t.SizeId, l.LocationId, l.StatusId, l.LicensePlate) AS LineNumber,
            t.ItemId, t.ColorId, t.SizeId, l.SiteId, l.LocationId, l.StatusId, l.LicensePlate,
            l.AvailQty, l.ReservedQty,
-           CASE WHEN t.PoolValue > 0 THEN ROUND(t.PoolValue / t.PoolQty, 2) ELSE 0 END AS CurrentUnitCost,
+           CASE WHEN t.PoolValue > 0 THEN ROUND(t.PoolValue / NULLIF(t.PoolQty, 0), 2) ELSE 0 END AS CurrentUnitCost,
            t.NewUnitCost, t.CostSource, t.SourcePO, t.PoolQty, t.PoolValue
     FROM target t
     JOIN loc l ON l.ItemId = t.ItemId AND l.ColorId = t.ColorId AND l.SizeId = t.SizeId
