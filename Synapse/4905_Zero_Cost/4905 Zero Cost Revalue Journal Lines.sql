@@ -1,12 +1,12 @@
 -- 4905 Zero Cost Revalue Journal Lines
 -- Builds the two MOV-DCADJ movement journals that reset under-costed 4905 stock to the confirmed PO cost,
 -- in the same shape as Udesh's 10/12/2026 fix (INV-02253604 pull back / INV-02253606 add back):
---   1 PULL BACK : remove the available units at their current (near-$0) average cost
+--   1 PULL BACK : remove the available units at $0 (their current average)
 --   2 ADD BACK  : put the same units back at the confirmed PO cost
 -- One row per 4905 item + color + size + location. Same LineNumber on both sides.
 --
 -- Which stock: 4905 cost pools (item + color + size; Active and Lock_Code share one pool) holding units
--- whose average is $0 or below @Threshold x the confirmed PO cost.
+-- whose average cost is $0.00 (value / units rounds to zero, or value is zero or negative).
 -- Confirmed PO cost (PO lines received into 4901 only), first found:
 --   a) latest confirmed PO line for the same item/color/size with landed cost per unit > 0
 --   b) latest confirmed PO for the item with landed cost: SUM(landed total) / SUM(qty)   (same math as ISS-01529)
@@ -16,8 +16,6 @@
 -- Quantity = AVAILABLE physical. Reserved or picked units can't be pulled back; ReservedQty shows any left
 -- behind at the old cost, which keeps that pool below the PO cost until they ship.
 -- Source: D365 Synapse (dataverse_psprod). Read-only.
-
-DECLARE @Threshold decimal(5,2) = 0.50;   -- pool average below 50% of PO cost counts as under-costed
 
 WITH pool AS (            -- 4905 moving-average cost pool per item + color + size
     SELECT s.itemid COLLATE DATABASE_DEFAULT AS ItemId,
@@ -75,7 +73,7 @@ target AS (               -- under-costed pools with their new cost
     LEFT JOIN item_landed il ON il.ItemId = p.ItemId AND il.rn = 1
     LEFT JOIN var_fob     vf ON vf.ItemId = p.ItemId AND vf.ColorId = p.ColorId AND vf.SizeId = p.SizeId AND vf.rn = 1
     WHERE COALESCE(vl.Cost, il.Cost, vf.Cost) > 0
-      AND (p.PoolValue <= 0 OR p.PoolValue / p.PoolQty < @Threshold * COALESCE(vl.Cost, il.Cost, vf.Cost))
+      AND (p.PoolValue <= 0 OR ROUND(p.PoolValue / p.PoolQty, 2) = 0)   -- $0 stock only
 ),
 loc AS (                  -- available units per 4905 location inside each target pool
     SELECT s.itemid COLLATE DATABASE_DEFAULT AS ItemId,
