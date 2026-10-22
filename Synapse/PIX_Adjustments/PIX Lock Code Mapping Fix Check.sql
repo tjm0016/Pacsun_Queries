@@ -4,19 +4,22 @@ PIX Lock Code Mapping Fix Check  (Synapse, D365 prod)
 Context: on 2026-10-22 WM (SLG3G7RP/SLG3G8RP) began sending lock refs 49 + 50 on BOTH legs of an
 active-location lock add (300/04/05 S + 606/06/05 A) and lock removal (300/04/06 A + 606/06/06 S).
 D365 books a 49+50 message as a full from/to move, so each move posted twice. Fix: delete the
-300/04/05 and 606/06/06 rows from PIX adjustment mapping.
+606/06/06 row from PIX adjustment mapping. 300/04/05 stays mapped at WM's request (putaway), so an
+active-location lock add (300/04/05 + 606/06/05, both 49+50) still posts twice - shown as
+"DOUBLED - known". 300/04/05 had occurred once since go-live (WM's 10/22 test).
 
 Set ChangeUtc (all three statements) to the UTC time the rows were deleted.
 Checks only PIX files processed after that time. Run 1-2 hours after the change (Synapse lag).
 
 Statement 1  mapping rows       -> every column PASS
-Statement 2  summary by flow    -> verdict OK for every flow; zero DOUBLED / LOCK NOT RELIEVED
+Statement 2  summary by flow    -> OK for every flow; zero DOUBLED / LOCK NOT RELIEVED
+                                   ("DOUBLED - known" lock adds are expected; watch the count)
 Statement 3  detail             -> the pxtrans that are not OK (empty = good)
 */
 
--- 1. Mapping rows: 300/04/05 and 606/06/06 gone, the rows we keep still there
+-- 1. Mapping rows: 606/06/06 gone, the rows we keep still there
 SELECT
-    CASE WHEN SUM(CASE WHEN pxtxtp='300' AND pxtxcd='04' AND pxaccd='05' THEN 1 ELSE 0 END) = 0 THEN 'PASS' ELSE 'FAIL - still mapped' END AS [300/04/05 deleted],
+    CASE WHEN SUM(CASE WHEN pxtxtp='300' AND pxtxcd='04' AND pxaccd='05' THEN 1 ELSE 0 END) = 1 THEN 'PASS' ELSE 'FAIL - missing' END AS [300/04/05 kept],
     CASE WHEN SUM(CASE WHEN pxtxtp='606' AND pxtxcd='06' AND pxaccd='06' THEN 1 ELSE 0 END) = 0 THEN 'PASS' ELSE 'FAIL - still mapped' END AS [606/06/06 deleted],
     CASE WHEN SUM(CASE WHEN pxtxtp='300' AND pxtxcd='04' AND pxaccd='06' THEN 1 ELSE 0 END) = 1 THEN 'PASS' ELSE 'FAIL - missing' END AS [300/04/06 kept],
     CASE WHEN SUM(CASE WHEN pxtxtp='606' AND pxtxcd='06' AND pxaccd='05' THEN 1 ELSE 0 END) = 1 THEN 'PASS' ELSE 'FAIL - missing' END AS [606/06/05 kept],
@@ -81,7 +84,8 @@ v AS (
                 ELSE 'Other' END AS flow,
            CASE WHEN w.has50 = 1 THEN 'new (49+50)' ELSE 'old' END AS layout,
            CASE WHEN ISNULL(x.d_active,0) = w.wm_active AND ISNULL(x.d_lock,0) = w.wm_lock THEN 'OK'
-                WHEN w.wm_lock <> 0 AND ISNULL(x.d_active,0) = 2*w.wm_active AND ISNULL(x.d_lock,0) = 2*w.wm_lock THEN 'DOUBLED'
+                WHEN w.wm_lock <> 0 AND ISNULL(x.d_active,0) = 2*w.wm_active AND ISNULL(x.d_lock,0) = 2*w.wm_lock
+                     THEN CASE WHEN w.f_add = 1 AND w.f_unlock = 0 AND w.f_case = 0 THEN 'DOUBLED - known (lock add, 300/04/05 kept per WM)' ELSE 'DOUBLED' END
                 WHEN w.wm_lock <> 0 AND ISNULL(x.d_lock,0) = 0 THEN 'LOCK NOT RELIEVED'
                 ELSE 'MISMATCH' END AS verdict
     FROM wm w LEFT JOIN d365 x ON x.pxtran = w.pxtran AND x.messageid = w.messageid
