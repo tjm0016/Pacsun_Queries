@@ -2,7 +2,12 @@
 -- Source: D365 prod Synapse (dataverse_psprod). Automation POs = created by svc_d365batch
 -- with a real orderer (the batch service's own default orderer is 000011).
 -- Shows CURRENT D365 state: deleted POs are gone, canceled POs keep their lines but qty = 0.
-DECLARE @GoLive datetime2 = '2026-10-13';
+-- Date range is in PACIFIC time, inclusive of both days. Automation went live 2026-10-13.
+DECLARE @FromDate date = '2026-10-13';
+DECLARE @ToDate   date = '2026-10-22';
+-- createddatetime is stored in UTC; convert the PT day boundaries to UTC.
+DECLARE @FromUtc datetime2 = CAST(CAST(@FromDate AS datetime2) AT TIME ZONE 'Pacific Standard Time' AT TIME ZONE 'UTC' AS datetime2);
+DECLARE @ToUtc   datetime2 = CAST(CAST(DATEADD(day, 1, @ToDate) AS datetime2) AT TIME ZONE 'Pacific Standard Time' AT TIME ZONE 'UTC' AS datetime2);
 
 WITH po AS (
     SELECT t.purchid, t.purchstatus, t.workerpurchplacer
@@ -12,7 +17,8 @@ WITH po AS (
       AND ISNULL(t.IsDelete, 0) = 0
       AND t.createdby = 'svc_d365batch'
       AND w.personnelnumber <> '000011'
-      AND t.createddatetime >= @GoLive
+      AND t.createddatetime >= @FromUtc
+      AND t.createddatetime <  @ToUtc
 ),
 ln AS (
     SELECT l.purchid, COUNT(*) AS lines, SUM(l.purchqty) AS units
