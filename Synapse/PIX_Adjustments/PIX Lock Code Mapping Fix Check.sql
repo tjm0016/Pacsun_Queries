@@ -83,7 +83,8 @@ v AS (
                 WHEN w.f_case = 1 THEN 'Case unlock (300/04/06 + 606/02/06)'
                 ELSE 'Other' END AS flow,
            CASE WHEN w.has50 = 1 THEN 'new (49+50)' ELSE 'old' END AS layout,
-           CASE WHEN ISNULL(x.d_active,0) = w.wm_active AND ISNULL(x.d_lock,0) = w.wm_lock THEN 'OK'
+           CASE WHEN ISNULL(x.d_lines,0) = 0 THEN 'NOT SYNCED YET (no pending lines in Synapse)'
+                WHEN ISNULL(x.d_active,0) = w.wm_active AND ISNULL(x.d_lock,0) = w.wm_lock THEN 'OK'
                 WHEN w.wm_lock <> 0 AND ISNULL(x.d_active,0) = 2*w.wm_active AND ISNULL(x.d_lock,0) = 2*w.wm_lock
                      THEN CASE WHEN w.f_add = 1 AND w.f_unlock = 0 AND w.f_case = 0 THEN 'DOUBLED - known (lock add, 300/04/05 kept per WM)' ELSE 'DOUBLED' END
                 WHEN w.wm_lock <> 0 AND ISNULL(x.d_lock,0) = 0 THEN 'LOCK NOT RELIEVED'
@@ -135,7 +136,8 @@ d365 AS (
     SELECT l.pxtran, l.messageid,
            SUM(CASE WHEN ISNULL(d.wmslocationid,'') IN ('','Active') THEN CAST(p.qty AS int) ELSE 0 END) AS d_active,
            SUM(CASE WHEN ISNULL(d.wmslocationid,'') NOT IN ('','Active') THEN CAST(p.qty AS int) ELSE 0 END) AS d_lock,
-           MIN(CAST(p.processed AS int)) AS all_processed
+           MIN(CAST(p.processed AS int)) AS all_processed,
+           COUNT(*) AS d_lines
     FROM legs l
     JOIN pacwmpendingadjustment p ON p.integrationlinerecid = l.recid
     JOIN inventdim d ON d.inventdimid = p.inventdimid
@@ -146,5 +148,6 @@ SELECT w.pxtran, w.messageid AS pix_file, w.sku,
        w.wm_active, ISNULL(x.d_active,0) AS d365_active, w.wm_lock, ISNULL(x.d_lock,0) AS d365_lock,
        x.all_processed
 FROM wm w LEFT JOIN d365 x ON x.pxtran = w.pxtran AND x.messageid = w.messageid
-WHERE NOT (ISNULL(x.d_active,0) = w.wm_active AND ISNULL(x.d_lock,0) = w.wm_lock)
+WHERE ISNULL(x.d_lines,0) > 0   -- skip transactions whose pending lines have not synced to Synapse yet
+  AND NOT (ISNULL(x.d_active,0) = w.wm_active AND ISNULL(x.d_lock,0) = w.wm_lock)
 ORDER BY w.pxtran;
