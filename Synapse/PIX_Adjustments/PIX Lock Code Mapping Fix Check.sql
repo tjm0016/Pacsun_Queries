@@ -15,6 +15,7 @@ Statement 1  mapping rows       -> every column PASS
 Statement 2  summary by flow    -> OK for every flow; zero DOUBLED / LOCK NOT RELIEVED
                                    ("DOUBLED - known" lock adds are expected; watch the count)
 Statement 3  detail             -> the pxtrans that are not OK (empty = good)
+A WM transaction can span two PIX files, so everything is keyed on pxtran, not file.
 */
 
 -- 1. Mapping rows: 606/06/06 gone, the rows we keep still there
@@ -48,12 +49,12 @@ legs AS (
         OR (m.pxtxtp='606' AND m.pxtxcd IN ('02','06') AND m.pxaccd IN ('05','06')))
 ),
 tx AS (   -- WM transactions that contain an active-location lock add or removal leg
-    SELECT pxtran, messageid FROM legs
+    SELECT pxtran FROM legs
     WHERE code IN ('300/04/05','300/04/06','606/06/05','606/06/06')
-    GROUP BY pxtran, messageid
+    GROUP BY pxtran
 ),
 wm AS (
-    SELECT l.pxtran, l.messageid,
+    SELECT l.pxtran, MAX(l.messageid) AS messageid,
            SUM(CASE WHEN LEFT(l.code,3)='300' THEN l.sqty ELSE 0 END) AS wm_active,
            SUM(CASE WHEN LEFT(l.code,3)='606' THEN l.sqty ELSE 0 END) AS wm_lock,
            MAX(CASE WHEN LEFT(l.code,3)='606' THEN ABS(l.sqty) ELSE 0 END) AS units,
@@ -61,18 +62,18 @@ wm AS (
            MAX(CASE WHEN l.code='606/06/06' THEN 1 ELSE 0 END) AS f_unlock,
            MAX(CASE WHEN l.code IN ('300/04/05','606/06/05') THEN 1 ELSE 0 END) AS f_add,
            MAX(CASE WHEN l.code='606/02/06' THEN 1 ELSE 0 END) AS f_case
-    FROM legs l JOIN tx ON tx.pxtran = l.pxtran AND tx.messageid = l.messageid
-    GROUP BY l.pxtran, l.messageid
+    FROM legs l JOIN tx ON tx.pxtran = l.pxtran
+    GROUP BY l.pxtran
 ),
 d365 AS (
-    SELECT l.pxtran, l.messageid,
+    SELECT l.pxtran, MAX(l.messageid) AS messageid,
            SUM(CASE WHEN ISNULL(d.wmslocationid,'') IN ('','Active') THEN CAST(p.qty AS int) ELSE 0 END) AS d_active,
            SUM(CASE WHEN ISNULL(d.wmslocationid,'') NOT IN ('','Active') THEN CAST(p.qty AS int) ELSE 0 END) AS d_lock,
            COUNT(*) AS d_lines
     FROM legs l
     JOIN pacwmpendingadjustment p ON p.integrationlinerecid = l.recid
     JOIN inventdim d ON d.inventdimid = p.inventdimid
-    GROUP BY l.pxtran, l.messageid
+    GROUP BY l.pxtran
 ),
 v AS (
     SELECT w.pxtran, w.messageid, w.units, w.wm_active, w.wm_lock,
@@ -89,7 +90,7 @@ v AS (
                      THEN CASE WHEN w.f_add = 1 AND w.f_unlock = 0 AND w.f_case = 0 THEN 'DOUBLED - known (lock add, 300/04/05 kept per WM)' ELSE 'DOUBLED' END
                 WHEN w.wm_lock <> 0 AND ISNULL(x.d_lock,0) = 0 THEN 'LOCK NOT RELIEVED'
                 ELSE 'MISMATCH' END AS verdict
-    FROM wm w LEFT JOIN d365 x ON x.pxtran = w.pxtran AND x.messageid = w.messageid
+    FROM wm w LEFT JOIN d365 x ON x.pxtran = w.pxtran
 )
 SELECT flow, layout, verdict, COUNT(*) AS pxtrans, SUM(units) AS units,
        MIN(pxtran) AS first_pxtran, MAX(pxtran) AS last_pxtran
@@ -120,20 +121,20 @@ legs AS (
         OR (m.pxtxtp='606' AND m.pxtxcd IN ('02','06') AND m.pxaccd IN ('05','06')))
 ),
 tx AS (
-    SELECT pxtran, messageid FROM legs
+    SELECT pxtran FROM legs
     WHERE code IN ('300/04/05','300/04/06','606/06/05','606/06/06')
-    GROUP BY pxtran, messageid
+    GROUP BY pxtran
 ),
 wm AS (
-    SELECT l.pxtran, l.messageid, MAX(l.sku) AS sku,
+    SELECT l.pxtran, MAX(l.messageid) AS messageid, MAX(l.sku) AS sku,
            SUM(CASE WHEN LEFT(l.code,3)='300' THEN l.sqty ELSE 0 END) AS wm_active,
            SUM(CASE WHEN LEFT(l.code,3)='606' THEN l.sqty ELSE 0 END) AS wm_lock,
            MAX(l.has50) AS has50
-    FROM legs l JOIN tx ON tx.pxtran = l.pxtran AND tx.messageid = l.messageid
-    GROUP BY l.pxtran, l.messageid
+    FROM legs l JOIN tx ON tx.pxtran = l.pxtran
+    GROUP BY l.pxtran
 ),
 d365 AS (
-    SELECT l.pxtran, l.messageid,
+    SELECT l.pxtran, MAX(l.messageid) AS messageid,
            SUM(CASE WHEN ISNULL(d.wmslocationid,'') IN ('','Active') THEN CAST(p.qty AS int) ELSE 0 END) AS d_active,
            SUM(CASE WHEN ISNULL(d.wmslocationid,'') NOT IN ('','Active') THEN CAST(p.qty AS int) ELSE 0 END) AS d_lock,
            MIN(CAST(p.processed AS int)) AS all_processed,
@@ -141,13 +142,13 @@ d365 AS (
     FROM legs l
     JOIN pacwmpendingadjustment p ON p.integrationlinerecid = l.recid
     JOIN inventdim d ON d.inventdimid = p.inventdimid
-    GROUP BY l.pxtran, l.messageid
+    GROUP BY l.pxtran
 )
 SELECT w.pxtran, w.messageid AS pix_file, w.sku,
        CASE WHEN w.has50 = 1 THEN 'new (49+50)' ELSE 'old' END AS layout,
        w.wm_active, ISNULL(x.d_active,0) AS d365_active, w.wm_lock, ISNULL(x.d_lock,0) AS d365_lock,
        x.all_processed
-FROM wm w LEFT JOIN d365 x ON x.pxtran = w.pxtran AND x.messageid = w.messageid
+FROM wm w LEFT JOIN d365 x ON x.pxtran = w.pxtran
 WHERE ISNULL(x.d_lines,0) > 0   -- skip transactions whose pending lines have not synced to Synapse yet
   AND NOT (ISNULL(x.d_active,0) = w.wm_active AND ISNULL(x.d_lock,0) = w.wm_lock)
 ORDER BY w.pxtran;
